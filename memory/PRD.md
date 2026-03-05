@@ -13,9 +13,13 @@ DentView is a mobile-first DICOM file viewer for dentists to open and view denta
 ## Core Features (MVP)
 1. **Home Screen**: File picker (expo-document-picker), demo mode, privacy badge, theme toggle
 2. **DICOM Viewer**: WebView-based rendering with dicomParser
-3. **Tools**: Pan, Zoom, Window/Level (Bone/Soft/Full presets), Measure, Rotate, Invert, Reset
-4. **DICOM Info Panel**: Patient name, study date, modality, image size, pixel spacing, W/C/W
+3. **Tools**: Pan, Zoom, Window/Level (Bone/Soft/Full presets), Measure, Rotate, Invert, Reset, Scroll (series)
+4. **DICOM Info Panel**: Patient name, study date, modality, image size, pixel spacing, W/C/W, slice info
 5. **Dark/Light Theme**: Dark mode default with toggle
+6. **ZIP Support**: Open .zip archives, extract .dcm files, present as scrollable series (JSZip)
+7. **Multi-file Selection**: Select multiple .dcm files and view as a series
+8. **Series Navigation**: Prev/Next buttons, slice counter, Scroll tool for CBCT-style viewing
+9. **Demo Series**: 12 synthetic dental slices for demonstration
 
 ## Tech Stack
 - Expo Router (file-based routing)
