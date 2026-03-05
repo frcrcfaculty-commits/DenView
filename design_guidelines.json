@@ -1,0 +1,121 @@
+{
+  "project_name": "DentView",
+  "version": "1.0.0",
+  "identity": {
+    "persona": "E1: The Anti-AI Designer",
+    "core_philosophy": "Medical Precision meets Swiss Design in the Dark.",
+    "emotional_tone": "Clinical, Trustworthy, Sharp, Focused.",
+    "visual_style": "Dark Mode Default. High Contrast. Neon Accents on Deep Charcoal.",
+    "anti_patterns": [
+      "No generic 'SaaS Blue' or 'Marketing Purple'.",
+      "No rounded-full buttons (unless icon-only).",
+      "No low-contrast gray text.",
+      "No gradients on backgrounds (keep it matte/flat for reading clarity)."
+    ]
+  },
+  "typography": {
+    "font_family_primary": "Manrope",
+    "font_family_code": "JetBrains Mono",
+    "scale": {
+      "h1": "text-3xl font-bold tracking-tight text-white",
+      "h2": "text-2xl font-semibold tracking-tight text-white",
+      "h3": "text-xl font-medium text-white",
+      "body": "text-base font-normal text-zinc-300",
+      "caption": "text-sm font-medium text-zinc-500 uppercase tracking-widest"
+    },
+    "rules": "Avoid Inter. Use Manrope for a modern, approachable yet technical feel."
+  },
+  "colors": {
+    "palette": {
+      "background": "#09090b",
+      "surface": "#18181b",
+      "surface_highlight": "#27272a",
+      "primary": "#06b6d4",
+      "primary_foreground": "#ffffff",
+      "secondary": "#27272a",
+      "secondary_foreground": "#e4e4e7",
+      "accent": "#22d3ee",
+      "destructive": "#ef4444",
+      "muted": "#71717a",
+      "border": "#27272a",
+      "overlay": "rgba(9, 9, 11, 0.8)"
+    },
+    "usage": {
+      "primary": "Main Actions (Open File, Measure).",
+      "background": "Global App Background.",
+      "surface": "Cards, Toolbars, Modals.",
+      "border": "Subtle separation (1px)."
+    }
+  },
+  "layout_strategy": {
+    "mobile_first": true,
+    "spacing_scale": {
+      "container": "px-6 py-6",
+      "section_gap": "gap-8",
+      "item_gap": "gap-4"
+    },
+    "grid_system": "Use a 1-column layout for mobile lists, 2-column 'Bento' grid for Recent Files on tablet/landscape.",
+    "touch_targets": "MINIMUM 44px height for all interactive elements. Add hitSlop if necessary."
+  },
+  "components": {
+    "Button": {
+      "default": "bg-cyan-600 active:bg-cyan-700 h-14 rounded-lg flex-row items-center justify-center px-6 shadow-[0_0_15px_rgba(6,182,212,0.3)]",
+      "secondary": "bg-zinc-800 active:bg-zinc-700 h-14 rounded-lg flex-row items-center justify-center px-6 border border-zinc-700",
+      "icon": "h-12 w-12 rounded-full bg-zinc-800 items-center justify-center border border-zinc-700 active:scale-95 transition-transform",
+      "text_style": "text-white font-bold text-lg tracking-wide"
+    },
+    "Card": {
+      "base": "bg-zinc-900/80 border border-zinc-800 rounded-xl p-5 backdrop-blur-md"
+    },
+    "Input": {
+      "base": "bg-zinc-950 border border-zinc-800 h-14 rounded-lg px-4 text-white focus:border-cyan-500 focus:border-2"
+    },
+    "Toolbar": {
+      "floating": "absolute bottom-8 left-4 right-4 bg-zinc-900/90 backdrop-blur-xl border border-zinc-800 rounded-2xl p-4 flex-row justify-between items-center shadow-2xl"
+    },
+    "Badge": {
+      "privacy": "bg-emerald-950/50 border border-emerald-800/50 px-3 py-1 rounded-full flex-row items-center gap-2"
+    }
+  },
+  "assets": {
+    "icons": {
+      "library": "lucide-react-native",
+      "style": "stroke-width=2 color={colors.palette.primary_foreground}",
+      "mapping": {
+        "file_picker": "FolderOpen",
+        "recent": "Clock",
+        "settings": "Settings",
+        "close": "X",
+        "menu": "Menu",
+        "zoom": "ZoomIn",
+        "pan": "Move",
+        "rotate": "RotateCw",
+        "measure": "Ruler",
+        "invert": "Contrast",
+        "sun": "Sun",
+        "moon": "Moon",
+        "info": "Info"
+      }
+    }
+  },
+  "webview_implementation": {
+    "engine": "cornerstone.js",
+    "rendering": "In-memory DICOM rendering via HTML5 Canvas inside WebView.",
+    "communication": "Use window.ReactNativeWebView.postMessage for bi-directional communication (Tool selection -> WebView -> Update Canvas).",
+    "theme_sync": "Inject CSS variables for Dark Mode into the HTML string."
+  },
+  "universal_guidelines_for_main_agent": [
+    "Install 'nativewind' and 'tailwindcss' immediately.",
+    "Configure 'tailwind.config.js' with the colors defined above.",
+    "Use 'react-native-safe-area-context' for layout wrappers.",
+    "Do NOT use 'StyleSheet.create' for basic styling; use className (NativeWind).",
+    "Ensure all text is readable in Dark Mode (Contrast Ratio > 4.5:1).",
+    "Interactive elements must provide visual feedback (opacity change or scale) on press.",
+    "Data-testids: Add 'data-testid' prop to all buttons and inputs (e.g., 'file-picker-btn', 'zoom-tool')."
+  ],
+  "next_steps_recommendation": [
+    "Initialize Tailwind/NativeWind.",
+    "Create the 'Viewer' component using 'react-native-webview'.",
+    "Implement the File Picker using 'expo-document-picker'."
+  ]
+}
