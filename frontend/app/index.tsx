@@ -21,75 +21,140 @@ import {
   Sun,
   Moon,
   ChevronRight,
-  Smartphone,
   Eye,
   Ruler,
   RotateCw,
+  Archive,
+  Files,
+  Layers,
 } from 'lucide-react-native';
 import { useTheme } from './_layout';
 import { fileStore } from '@/src/store/fileStore';
+
+async function readUriAsBase64(uri: string): Promise<string> {
+  if (Platform.OS === 'web') {
+    const response = await fetch(uri);
+    const blob = await response.blob();
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        resolve(result.split(',')[1]);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  }
+  return FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+}
 
 export default function HomeScreen() {
   const { isDark, colors, toggle } = useTheme();
   const router = useRouter();
   const [loading, setLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState('');
 
-  const pickFile = useCallback(async () => {
+  const pickSingleFile = useCallback(async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: ['application/dicom', 'application/octet-stream', '*/*'],
         copyToCacheDirectory: true,
+        multiple: false,
       });
-
-      if (result.canceled || !result.assets || result.assets.length === 0) return;
+      if (result.canceled || !result.assets?.length) return;
 
       const file = result.assets[0];
       const ext = file.name?.toLowerCase().split('.').pop();
-      if (ext !== 'dcm' && ext !== 'dicom') {
-        Alert.alert(
-          'File Type',
-          'Selected file may not be a DICOM file. Attempting to open anyway.',
-          [
-            { text: 'Cancel', style: 'cancel' },
-            { text: 'Open', onPress: () => loadFile(file.uri, file.name) },
-          ]
-        );
-        return;
+
+      if (ext === 'zip') {
+        await loadZipFile(file.uri, file.name);
+      } else if (ext !== 'dcm' && ext !== 'dicom') {
+        Alert.alert('File Type', 'File may not be DICOM. Try opening anyway?', [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Open', onPress: () => loadSingleFile(file.uri, file.name) },
+        ]);
+      } else {
+        await loadSingleFile(file.uri, file.name);
       }
-      await loadFile(file.uri, file.name);
     } catch (err: any) {
       Alert.alert('Error', 'Could not pick file: ' + err.message);
     }
   }, []);
 
-  const loadFile = async (uri: string, name: string) => {
-    setLoading(true);
+  const pickZipFile = useCallback(async () => {
     try {
-      let base64: string;
-      if (Platform.OS === 'web') {
-        const response = await fetch(uri);
-        const blob = await response.blob();
-        base64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const result = reader.result as string;
-            resolve(result.split(',')[1]);
-          };
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-      } else {
-        base64 = await FileSystem.readAsStringAsync(uri, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/zip', 'application/x-zip-compressed', 'application/octet-stream', '*/*'],
+        copyToCacheDirectory: true,
+        multiple: false,
+      });
+      if (result.canceled || !result.assets?.length) return;
+      const file = result.assets[0];
+      await loadZipFile(file.uri, file.name);
+    } catch (err: any) {
+      Alert.alert('Error', 'Could not pick file: ' + err.message);
+    }
+  }, []);
+
+  const pickMultipleFiles = useCallback(async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/dicom', 'application/octet-stream', '*/*'],
+        copyToCacheDirectory: true,
+        multiple: true,
+      });
+      if (result.canceled || !result.assets?.length) return;
+
+      setLoading(true);
+      setLoadingLabel('Reading ' + result.assets.length + ' files...');
+
+      const files: { data: string; name: string }[] = [];
+      for (let i = 0; i < result.assets.length; i++) {
+        const asset = result.assets[i];
+        setLoadingLabel('Reading ' + (i + 1) + '/' + result.assets.length + '...');
+        const base64 = await readUriAsBase64(asset.uri);
+        files.push({ data: base64, name: asset.name });
       }
 
+      fileStore.setMultiFiles(files);
+      router.push({ pathname: '/viewer', params: { fileName: files.length + ' DICOM files', mode: 'multi' } });
+    } catch (err: any) {
+      Alert.alert('Error', 'Could not read files: ' + err.message);
+    } finally {
+      setLoading(false);
+      setLoadingLabel('');
+    }
+  }, []);
+
+  const loadSingleFile = async (uri: string, name: string) => {
+    setLoading(true);
+    setLoadingLabel('Reading file...');
+    try {
+      const base64 = await readUriAsBase64(uri);
       fileStore.setFile(base64, name);
-      router.push({ pathname: '/viewer', params: { fileName: name } });
+      router.push({ pathname: '/viewer', params: { fileName: name, mode: 'single' } });
     } catch (err: any) {
       Alert.alert('Error', 'Could not read file: ' + err.message);
     } finally {
       setLoading(false);
+      setLoadingLabel('');
+    }
+  };
+
+  const loadZipFile = async (uri: string, name: string) => {
+    setLoading(true);
+    setLoadingLabel('Reading ZIP file...');
+    try {
+      const base64 = await readUriAsBase64(uri);
+      fileStore.setZip(base64, name);
+      router.push({ pathname: '/viewer', params: { fileName: name, mode: 'zip' } });
+    } catch (err: any) {
+      Alert.alert('Error', 'Could not read ZIP: ' + err.message);
+    } finally {
+      setLoading(false);
+      setLoadingLabel('');
     }
   };
 
@@ -102,19 +167,11 @@ export default function HomeScreen() {
 
   return (
     <SafeAreaView style={[s.container, { backgroundColor: colors.background }]}>
-      <ScrollView
-        contentContainerStyle={s.scrollContent}
-        showsVerticalScrollIndicator={false}
-      >
+      <ScrollView contentContainerStyle={s.scrollContent} showsVerticalScrollIndicator={false}>
         {/* Header */}
         <View style={s.header}>
           <View style={s.headerLeft}>
-            <FontAwesome5
-              name="tooth"
-              size={22}
-              color={colors.primary}
-              testID="app-logo"
-            />
+            <FontAwesome5 name="tooth" size={22} color={colors.primary} testID="app-logo" />
             <Text style={[s.headerTitle, { color: colors.text }]}>DentView</Text>
           </View>
           <TouchableOpacity
@@ -123,59 +180,80 @@ export default function HomeScreen() {
             style={[s.themeBtn, { backgroundColor: colors.surface, borderColor: colors.border }]}
             activeOpacity={0.7}
           >
-            {isDark ? (
-              <Sun size={20} color={colors.textSecondary} />
-            ) : (
-              <Moon size={20} color={colors.textSecondary} />
-            )}
+            {isDark ? <Sun size={20} color={colors.textSecondary} /> : <Moon size={20} color={colors.textSecondary} />}
           </TouchableOpacity>
         </View>
 
-        {/* Hero Section */}
+        {/* Hero */}
         <View style={s.heroSection}>
           <View style={[s.heroIconWrap, { backgroundColor: colors.surface, borderColor: colors.border }]}>
             <Eye size={48} color={colors.primary} strokeWidth={1.5} />
           </View>
-          <Text style={[s.heroTitle, { color: colors.text }]}>
-            Dental DICOM Viewer
-          </Text>
+          <Text style={[s.heroTitle, { color: colors.text }]}>Dental DICOM Viewer</Text>
           <Text style={[s.heroSubtitle, { color: colors.textSecondary }]}>
             Open and view dental X-rays directly on your phone.{'\n'}
-            Zoom, measure, and adjust — all in your browser.
+            Supports single files, ZIP archives, and batch selection.
           </Text>
         </View>
 
+        {/* Loading overlay */}
+        {loading && (
+          <View style={[s.loadingOverlay, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+            <ActivityIndicator color={colors.primary} size="small" />
+            <Text style={[s.loadingText, { color: colors.textSecondary }]}>{loadingLabel}</Text>
+          </View>
+        )}
+
         {/* Action Buttons */}
         <View style={s.actionSection}>
+          {/* Open Single / Auto-detect */}
           <TouchableOpacity
             testID="open-file-btn"
-            onPress={pickFile}
+            onPress={pickSingleFile}
             style={[s.primaryBtn, { backgroundColor: colors.primary }]}
             activeOpacity={0.8}
             disabled={loading}
           >
-            {loading ? (
-              <ActivityIndicator color="#fff" size="small" />
-            ) : (
-              <FolderOpen size={22} color="#fff" />
-            )}
-            <Text style={s.primaryBtnText}>
-              {loading ? 'Reading file...' : 'Open DICOM File'}
-            </Text>
+            <FolderOpen size={22} color="#fff" />
+            <Text style={s.primaryBtnText}>Open DICOM / ZIP File</Text>
             <ChevronRight size={18} color="rgba(255,255,255,0.6)" />
           </TouchableOpacity>
 
+          {/* Open ZIP */}
+          <TouchableOpacity
+            testID="open-zip-btn"
+            onPress={pickZipFile}
+            style={[s.secondaryBtn, { backgroundColor: colors.surface, borderColor: colors.border }]}
+            activeOpacity={0.8}
+            disabled={loading}
+          >
+            <Archive size={20} color={colors.primary} />
+            <Text style={[s.secondaryBtnText, { color: colors.text }]}>Open ZIP Archive</Text>
+            <ChevronRight size={18} color={colors.muted} />
+          </TouchableOpacity>
+
+          {/* Select Multiple DCMs */}
+          <TouchableOpacity
+            testID="open-multi-btn"
+            onPress={pickMultipleFiles}
+            style={[s.secondaryBtn, { backgroundColor: colors.surface, borderColor: colors.border }]}
+            activeOpacity={0.8}
+            disabled={loading}
+          >
+            <Files size={20} color={colors.primary} />
+            <Text style={[s.secondaryBtnText, { color: colors.text }]}>Select Multiple .dcm Files</Text>
+            <ChevronRight size={18} color={colors.muted} />
+          </TouchableOpacity>
+
+          {/* Demo */}
           <TouchableOpacity
             testID="load-demo-btn"
             onPress={openDemo}
-            style={[s.secondaryBtn, { backgroundColor: colors.surface, borderColor: colors.border }]}
+            style={[s.tertiaryBtn, { borderColor: colors.border }]}
             activeOpacity={0.8}
           >
-            <Play size={20} color={colors.primary} />
-            <Text style={[s.secondaryBtnText, { color: colors.text }]}>
-              Load Demo Image
-            </Text>
-            <ChevronRight size={18} color={colors.muted} />
+            <Play size={18} color={colors.primary} />
+            <Text style={[s.tertiaryBtnText, { color: colors.textSecondary }]}>Load Demo Series (12 slices)</Text>
           </TouchableOpacity>
         </View>
 
@@ -185,8 +263,8 @@ export default function HomeScreen() {
           <View style={s.featuresGrid}>
             {[
               { icon: Eye, label: 'View X-Rays', desc: 'Open .dcm files' },
+              { icon: Layers, label: 'Series / ZIP', desc: 'CBCT slice scrolling' },
               { icon: Ruler, label: 'Measure', desc: 'Distance in mm' },
-              { icon: Sun, label: 'Window/Level', desc: 'Bone & Soft presets' },
               { icon: RotateCw, label: 'Transform', desc: 'Rotate & invert' },
             ].map((f, i) => (
               <View
@@ -205,9 +283,7 @@ export default function HomeScreen() {
         <View style={[s.privacyBadge, { backgroundColor: isDark ? 'rgba(16,185,129,0.08)' : 'rgba(5,150,105,0.06)', borderColor: isDark ? 'rgba(16,185,129,0.2)' : 'rgba(5,150,105,0.15)' }]}>
           <Shield size={18} color={colors.success} />
           <View style={s.privacyTextWrap}>
-            <Text style={[s.privacyTitle, { color: colors.success }]}>
-              Files never leave your device
-            </Text>
+            <Text style={[s.privacyTitle, { color: colors.success }]}>Files never leave your device</Text>
             <Text style={[s.privacyDesc, { color: colors.muted }]}>
               Zero server uploads · No cookies · No tracking
             </Text>
@@ -218,11 +294,8 @@ export default function HomeScreen() {
         <View style={s.formatsSection}>
           <Text style={[s.sectionLabel, { color: colors.muted }]}>SUPPORTED</Text>
           <View style={s.formatsRow}>
-            {['Panoramic', 'Periapical', 'Bitewing', 'CBCT'].map((f) => (
-              <View
-                key={f}
-                style={[s.formatChip, { backgroundColor: colors.surface, borderColor: colors.border }]}
-              >
+            {['Panoramic', 'Periapical', 'Bitewing', 'CBCT', 'ZIP'].map((f) => (
+              <View key={f} style={[s.formatChip, { backgroundColor: colors.surface, borderColor: colors.border }]}>
                 <Text style={[s.formatText, { color: colors.textSecondary }]}>{f}</Text>
               </View>
             ))}
@@ -240,98 +313,62 @@ const getStyles = (colors: any) =>
     container: { flex: 1 },
     scrollContent: { paddingHorizontal: 24, paddingTop: Platform.OS === 'android' ? 48 : 12 },
     header: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      paddingVertical: 16,
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 16,
     },
     headerLeft: { flexDirection: 'row', alignItems: 'center', gap: 10 },
     headerTitle: { fontSize: 22, fontWeight: '700', letterSpacing: -0.5 },
     themeBtn: {
-      width: 44,
-      height: 44,
-      borderRadius: 22,
-      alignItems: 'center',
-      justifyContent: 'center',
-      borderWidth: 1,
+      width: 44, height: 44, borderRadius: 22,
+      alignItems: 'center', justifyContent: 'center', borderWidth: 1,
     },
-    heroSection: { alignItems: 'center', paddingTop: 32, paddingBottom: 36 },
+    heroSection: { alignItems: 'center', paddingTop: 28, paddingBottom: 28 },
     heroIconWrap: {
-      width: 96,
-      height: 96,
-      borderRadius: 28,
-      alignItems: 'center',
-      justifyContent: 'center',
-      borderWidth: 1,
-      marginBottom: 20,
+      width: 96, height: 96, borderRadius: 28,
+      alignItems: 'center', justifyContent: 'center', borderWidth: 1, marginBottom: 20,
     },
     heroTitle: { fontSize: 28, fontWeight: '800', letterSpacing: -0.8, marginBottom: 10 },
-    heroSubtitle: { fontSize: 15, lineHeight: 22, textAlign: 'center', maxWidth: 300 },
-    actionSection: { gap: 12, marginBottom: 36 },
+    heroSubtitle: { fontSize: 15, lineHeight: 22, textAlign: 'center', maxWidth: 320 },
+    loadingOverlay: {
+      flexDirection: 'row', alignItems: 'center', gap: 12,
+      padding: 16, borderRadius: 14, borderWidth: 1, marginBottom: 12,
+    },
+    loadingText: { fontSize: 14 },
+    actionSection: { gap: 10, marginBottom: 28 },
     primaryBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      height: 58,
-      borderRadius: 16,
-      paddingHorizontal: 24,
-      gap: 12,
-      boxShadow: '0 4px 12px rgba(6, 182, 212, 0.3)',
-      elevation: 6,
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+      height: 58, borderRadius: 16, paddingHorizontal: 24, gap: 12,
+      boxShadow: '0 4px 12px rgba(6, 182, 212, 0.3)', elevation: 6,
     },
-    primaryBtnText: { fontSize: 17, fontWeight: '700', color: '#fff', flex: 1 },
+    primaryBtnText: { fontSize: 16, fontWeight: '700', color: '#fff', flex: 1 },
     secondaryBtn: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'center',
-      height: 54,
-      borderRadius: 14,
-      paddingHorizontal: 24,
-      gap: 12,
-      borderWidth: 1,
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+      height: 52, borderRadius: 14, paddingHorizontal: 24, gap: 12, borderWidth: 1,
     },
-    secondaryBtnText: { fontSize: 16, fontWeight: '600', flex: 1 },
+    secondaryBtnText: { fontSize: 15, fontWeight: '600', flex: 1 },
+    tertiaryBtn: {
+      flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+      height: 44, borderRadius: 12, paddingHorizontal: 20, gap: 10,
+      borderWidth: 1, borderStyle: 'dashed' as any,
+    },
+    tertiaryBtnText: { fontSize: 13, fontWeight: '500', flex: 1 },
     featuresSection: { marginBottom: 28 },
-    sectionLabel: {
-      fontSize: 11,
-      fontWeight: '700',
-      letterSpacing: 1.5,
-      marginBottom: 12,
-    },
-    featuresGrid: {
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: 10,
-    },
+    sectionLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 1.5, marginBottom: 12 },
+    featuresGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
     featureCard: {
-      width: '48%' as any,
-      flexBasis: '47%',
-      padding: 16,
-      borderRadius: 14,
-      borderWidth: 1,
-      gap: 6,
+      width: '48%' as any, flexBasis: '47%',
+      padding: 16, borderRadius: 14, borderWidth: 1, gap: 6,
     },
     featureLabel: { fontSize: 14, fontWeight: '600' },
     featureDesc: { fontSize: 12 },
     privacyBadge: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      padding: 16,
-      borderRadius: 14,
-      borderWidth: 1,
-      gap: 14,
-      marginBottom: 28,
+      flexDirection: 'row', alignItems: 'center',
+      padding: 16, borderRadius: 14, borderWidth: 1, gap: 14, marginBottom: 28,
     },
     privacyTextWrap: { flex: 1 },
     privacyTitle: { fontSize: 14, fontWeight: '700', marginBottom: 2 },
     privacyDesc: { fontSize: 12 },
     formatsSection: { marginBottom: 8 },
     formatsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-    formatChip: {
-      paddingHorizontal: 14,
-      paddingVertical: 8,
-      borderRadius: 20,
-      borderWidth: 1,
-    },
+    formatChip: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 20, borderWidth: 1 },
     formatText: { fontSize: 13, fontWeight: '500' },
   });
