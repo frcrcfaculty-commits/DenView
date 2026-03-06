@@ -7,6 +7,8 @@ import {
   SafeAreaView,
   Platform,
   Animated,
+  PanResponder,
+  LayoutChangeEvent,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import {
@@ -24,11 +26,14 @@ import {
   X,
   Trash2,
   Layers,
+  Download,
+  Share2,
 } from 'lucide-react-native';
-import { ScrollView } from 'react-native';
+import { ScrollView, Alert } from 'react-native';
 import { useTheme } from './_layout';
 import { fileStore } from '@/src/store/fileStore';
 import { getDicomViewerHtml } from '@/src/utils/dicomViewerHtml';
+import * as FileSystem from 'expo-file-system';
 
 let NativeWebView: any = null;
 if (Platform.OS !== 'web') {
@@ -91,6 +96,97 @@ export default function ViewerScreen() {
   const [highlightedTooth, setHighlightedTooth] = useState<number | null>(null);
   const [hasVolume, setHasVolume] = useState(false);
   const [currentViewMode, setCurrentViewMode] = useState('axial');
+
+  /* ── Slice Slider ── */
+  const sliderWidthRef = useRef(0);
+  const seriesTotalRef = useRef(0);
+  const seriesCurrentRef = useRef(0);
+  const currentViewModeRef = useRef('axial');
+  const sendCommandRef = useRef(sendCommand);
+
+  useEffect(() => { seriesTotalRef.current = seriesTotal; }, [seriesTotal]);
+  useEffect(() => { seriesCurrentRef.current = seriesCurrent; }, [seriesCurrent]);
+  useEffect(() => { currentViewModeRef.current = currentViewMode; }, [currentViewMode]);
+  useEffect(() => { sendCommandRef.current = sendCommand; }, [sendCommand]);
+
+  const handleSliderTouch = useCallback((locationX: number) => {
+    const w = sliderWidthRef.current;
+    const total = seriesTotalRef.current;
+    const current = seriesCurrentRef.current;
+    if (w <= 0 || total <= 1) return;
+    const ratio = Math.max(0, Math.min(1, locationX / w));
+    const targetSlice = Math.round(ratio * (total - 1));
+    if (targetSlice !== current) {
+      if (currentViewModeRef.current === 'axial') {
+        sendCommandRef.current({ type: 'setSlice', index: targetSlice });
+      } else {
+        sendCommandRef.current({ type: 'setMPRSlice', index: targetSlice });
+      }
+    }
+  }, []);
+
+  const sliderPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderGrant: (evt) => {
+        handleSliderTouch(evt.nativeEvent.locationX);
+      },
+      onPanResponderMove: (evt) => {
+        handleSliderTouch(evt.nativeEvent.locationX);
+      },
+    })
+  ).current;
+
+  const onSliderLayout = useCallback((e: LayoutChangeEvent) => {
+    sliderWidthRef.current = e.nativeEvent.layout.width;
+  }, []);
+
+  const [exporting, setExporting] = useState(false);
+
+  const handleExportImage = useCallback(() => {
+    setExporting(true);
+    sendCommand({ type: 'exportView' });
+    // Timeout fallback in case WebView doesn't respond
+    setTimeout(() => setExporting(false), 5000);
+  }, [sendCommand]);
+
+  const handleExportedData = useCallback(async (dataUrl: string) => {
+    setExporting(false);
+    try {
+      if (Platform.OS === 'web') {
+        // Web: trigger download
+        const link = document.createElement('a');
+        link.href = dataUrl;
+        const sliceLabel = isSeries ? `_slice${seriesCurrent + 1}` : '';
+        const viewLabel = currentViewMode !== 'axial' ? `_${currentViewMode}` : '';
+        link.download = `DentView${viewLabel}${sliceLabel}.png`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        return;
+      }
+      // Native: save to cache then share
+      const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
+      const sliceLabel = isSeries ? `_slice${seriesCurrent + 1}` : '';
+      const viewLabel = currentViewMode !== 'axial' ? `_${currentViewMode}` : '';
+      const filePath = `${FileSystem.cacheDirectory}DentView${viewLabel}${sliceLabel}.png`;
+      await FileSystem.writeAsStringAsync(filePath, base64Data, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      // Try to use Sharing API if available
+      try {
+        const Sharing = require('expo-sharing');
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(filePath, { mimeType: 'image/png' });
+          return;
+        }
+      } catch (_) {}
+      Alert.alert('Saved', 'Image saved to: ' + filePath);
+    } catch (err: any) {
+      Alert.alert('Export Error', err.message || 'Could not export image');
+    }
+  }, [isSeries, seriesCurrent, currentViewMode]);
 
   const toastOpacity = useRef(new Animated.Value(0)).current;
   const isDemo = params.demo === 'true';
@@ -287,6 +383,12 @@ export default function ViewerScreen() {
       case 'wlUpdate':
         setWlValues({ center: msg.data.center, width: msg.data.width });
         break;
+      case 'exportedView':
+        handleExportedData(msg.data.dataUrl);
+        break;
+      case 'memoryWarning':
+        showMeasureToastFn(msg.data.suggestion || 'Large volume loaded');
+        break;
     }
   }, []);
 
@@ -409,6 +511,15 @@ export default function ViewerScreen() {
             </Text>
           )}
         </View>
+        <TouchableOpacity
+          testID="export-btn"
+          onPress={handleExportImage}
+          style={s.topBtn}
+          activeOpacity={0.7}
+          disabled={exporting || !metadata}
+        >
+          <Download size={20} color={exporting ? '#06b6d4' : '#a1a1aa'} />
+        </TouchableOpacity>
         <TouchableOpacity
           testID="info-toggle-btn"
           onPress={() => setShowInfo(!showInfo)}
@@ -739,6 +850,37 @@ export default function ViewerScreen() {
         </View>
       )}
 
+      {/* Slice Scrubber/Slider */}
+      {isSeries && seriesTotal > 1 && (
+        <View style={s.sliderContainer}>
+          <Text style={s.sliderLabel}>{seriesCurrent + 1}</Text>
+          <View
+            style={s.sliderTrack}
+            onLayout={onSliderLayout}
+            {...sliderPanResponder.panHandlers}
+          >
+            <View style={s.sliderTrackBg} />
+            <View
+              style={[
+                s.sliderFill,
+                { width: seriesTotal > 1 ? `${(seriesCurrent / (seriesTotal - 1)) * 100}%` as any : '0%' },
+              ]}
+            />
+            <View
+              style={[
+                s.sliderThumb,
+                {
+                  left: seriesTotal > 1
+                    ? `${(seriesCurrent / (seriesTotal - 1)) * 100}%` as any
+                    : '0%',
+                },
+              ]}
+            />
+          </View>
+          <Text style={s.sliderLabel}>{seriesTotal}</Text>
+        </View>
+      )}
+
       {/* Toolbar */}
       <View style={s.toolbar}>
         <View style={s.toolbarInner}>
@@ -937,4 +1079,33 @@ const styles = StyleSheet.create({
   },
   viewModeText: { color: '#71717a', fontSize: 12, fontWeight: '600' },
   viewModeTextActive: { color: '#06b6d4' },
+  // Slice slider
+  sliderContainer: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    paddingHorizontal: 14, paddingVertical: 8,
+    backgroundColor: 'rgba(9,9,11,0.95)', borderTopWidth: 1, borderTopColor: '#1a1a1e',
+  },
+  sliderLabel: {
+    color: '#52525b', fontSize: 11, fontWeight: '700', fontVariant: ['tabular-nums'] as any,
+    minWidth: 30, textAlign: 'center',
+  },
+  sliderTrack: {
+    flex: 1, height: 32, justifyContent: 'center', position: 'relative',
+  },
+  sliderTrackBg: {
+    position: 'absolute', left: 0, right: 0, height: 4,
+    backgroundColor: '#27272a', borderRadius: 2,
+  },
+  sliderFill: {
+    position: 'absolute', left: 0, height: 4,
+    backgroundColor: '#06b6d4', borderRadius: 2,
+  },
+  sliderThumb: {
+    position: 'absolute', width: 18, height: 18,
+    borderRadius: 9, backgroundColor: '#06b6d4',
+    borderWidth: 2, borderColor: '#09090b',
+    marginLeft: -9, top: 7,
+    shadowColor: '#06b6d4', shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.5, shadowRadius: 4, elevation: 4,
+  },
 });

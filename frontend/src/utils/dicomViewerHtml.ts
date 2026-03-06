@@ -28,6 +28,7 @@ html,body{width:100%;height:100%;overflow:hidden;background:#09090b;touch-action
 <div id="progressBar"><div class="text" id="progText">Loading...</div><div class="subtext" id="progSub"></div><div class="bar"><div class="fill" id="progFill" style="width:0%"></div></div></div>
 <script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
 <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jpeg-lossless-decoder-js/release/current/lossless.js"></script>
 <script>
 (function(){
 'use strict';
@@ -57,6 +58,8 @@ var volWL={center:500,width:2500};
 var viewMode='axial';   // axial | coronal | sagittal | panoramic
 var mprSlice=0;         // current position in coronal/sagittal/panoramic mode
 var mprTotal=0;         // total slices in current MPR mode
+var panoCache=null;     // cached panoramic reconstruction
+var memoryWarned=false;  // only warn once about large volumes
 
 /* ── DOM refs ── */
 var canvas=document.getElementById('canvas');
@@ -125,6 +128,160 @@ function naturalCompare(a,b){
 }
 
 /* ── DICOM Parser ── */
+
+/* ── Compressed Transfer Syntax Support ── */
+var TS_IMPLICIT_VR_LE='1.2.840.10008.1.2';
+var TS_EXPLICIT_VR_LE='1.2.840.10008.1.2.1';
+var TS_EXPLICIT_VR_BE='1.2.840.10008.1.2.2';
+var TS_DEFLATED='1.2.840.10008.1.2.1.99';
+var TS_JPEG_BASELINE='1.2.840.10008.1.2.4.50';
+var TS_JPEG_EXTENDED='1.2.840.10008.1.2.4.51';
+var TS_JPEG_LOSSLESS_P14='1.2.840.10008.1.2.4.57';
+var TS_JPEG_LOSSLESS='1.2.840.10008.1.2.4.70';
+var TS_JPEG2K_LOSSLESS='1.2.840.10008.1.2.4.90';
+var TS_JPEG2K='1.2.840.10008.1.2.4.91';
+var TS_JPEGLS_LOSSLESS='1.2.840.10008.1.2.4.80';
+var TS_JPEGLS='1.2.840.10008.1.2.4.81';
+var TS_RLE='1.2.840.10008.1.2.5';
+
+function isEncapsulatedTS(ts){
+  if(!ts) return false;
+  return ts!==TS_IMPLICIT_VR_LE && ts!==TS_EXPLICIT_VR_LE && ts!==TS_EXPLICIT_VR_BE && ts!==TS_DEFLATED;
+}
+
+function extractEncapsulatedFrame(ds,pixelDataEl){
+  try{
+    /* Use dicomParser built-in if available */
+    if(pixelDataEl.fragments && pixelDataEl.fragments.length>0){
+      if(typeof dicomParser.readEncapsulatedPixelDataFromFragments==='function'){
+        return dicomParser.readEncapsulatedPixelDataFromFragments(ds,pixelDataEl,0,pixelDataEl.fragments.length);
+      }
+      /* Manual extraction */
+      var totalLen=0;
+      for(var i=0;i<pixelDataEl.fragments.length;i++) totalLen+=pixelDataEl.fragments[i].length;
+      var result=new Uint8Array(totalLen);
+      var off=0;
+      for(var i=0;i<pixelDataEl.fragments.length;i++){
+        var frag=pixelDataEl.fragments[i];
+        var fragData=new Uint8Array(ds.byteArray.buffer,ds.byteArray.byteOffset+frag.position,frag.length);
+        result.set(fragData,off);
+        off+=frag.length;
+      }
+      return result;
+    }
+  }catch(e){}
+  return null;
+}
+
+function decodeJPEGLossless(frameData,frameSize,bitsAlloc,pixelRep){
+  if(typeof jpeg==='undefined'||!jpeg.lossless||!jpeg.lossless.Decoder){
+    throw new Error('JPEG Lossless decoder not loaded. Check network connection.');
+  }
+  var decoder=new jpeg.lossless.Decoder();
+  var output=decoder.decompress(new DataView(frameData.buffer,frameData.byteOffset,frameData.byteLength));
+  if(!output) throw new Error('JPEG Lossless decode failed');
+  if(bitsAlloc<=8) return new Uint8Array(output);
+  if(pixelRep===1) return new Int16Array(output);
+  return new Uint16Array(output);
+}
+
+function decodeJPEGBaseline(frameData,rows,cols,bitsAlloc,pixelRep,samplesPerPixel){
+  /* Synchronous decode using off-screen canvas trick via createImageBitmap is async.
+   * Use a simpler approach: build JPEG blob, decode via temporary Image.
+   * Since this must be sync, we do a blocking XHR to a data URI — but that's not reliable.
+   * Instead, we fall back to a direct byte-level JPEG decode for 8-bit grayscale. */
+  
+  /* For 8-bit lossy JPEG, the compressed data IS a standard JPEG.
+   * Create a blob URL, load via Image, draw to canvas, extract pixels.
+   * This is inherently async. We'll store a promise and render when ready. */
+  var blob=new Blob([frameData],{type:'image/jpeg'});
+  var url=URL.createObjectURL(blob);
+  
+  /* We return a placeholder and schedule async decode */
+  var placeholder=new Int16Array(rows*cols*samplesPerPixel);
+  
+  var img=new Image();
+  img.onload=function(){
+    var tc=document.createElement('canvas');
+    tc.width=cols;tc.height=rows;
+    var tctx=tc.getContext('2d');
+    tctx.drawImage(img,0,0,cols,rows);
+    var idata=tctx.getImageData(0,0,cols,rows);
+    for(var i=0;i<rows*cols;i++){
+      placeholder[i]=idata.data[i*4]; /* R channel for grayscale */
+    }
+    URL.revokeObjectURL(url);
+    /* Re-render after async decode completes */
+    renderWindowed();drawFrame();
+  };
+  img.onerror=function(){URL.revokeObjectURL(url);};
+  img.src=url;
+  return placeholder;
+}
+
+function decodeRLE(frameData,rows,cols,bitsAlloc,pixelRep,samplesPerPixel){
+  if(frameData.length<64) throw new Error('RLE data too short');
+  var view=new DataView(frameData.buffer,frameData.byteOffset,frameData.byteLength);
+  var nSegments=view.getUint32(0,true);
+  var offsets=[];
+  for(var i=0;i<nSegments;i++) offsets.push(view.getUint32((i+1)*4,true));
+
+  var bytesPerPixel=Math.ceil(bitsAlloc/8);
+  var outputSize=rows*cols*samplesPerPixel*bytesPerPixel;
+  var output=new Uint8Array(outputSize);
+
+  for(var seg=0;seg<nSegments;seg++){
+    var start=offsets[seg];
+    var end=(seg+1<nSegments)?offsets[seg+1]:frameData.length;
+    var outOffset=seg;
+    var pos=start;
+    while(pos<end && outOffset<outputSize){
+      var n=frameData[pos++];
+      if(n===undefined) break;
+      if(n<=127){
+        var count=n+1;
+        for(var j=0;j<count && pos<end && outOffset<outputSize;j++){
+          output[outOffset]=frameData[pos++];
+          outOffset+=nSegments;
+        }
+      }else if(n>128){
+        var count=257-n;
+        var val=frameData[pos++];
+        for(var j=0;j<count && outOffset<outputSize;j++){
+          output[outOffset]=val;
+          outOffset+=nSegments;
+        }
+      }
+    }
+  }
+  if(bitsAlloc<=8) return output;
+  if(pixelRep===1) return new Int16Array(output.buffer);
+  return new Uint16Array(output.buffer);
+}
+
+function decodeCompressedFrame(frameData,ts,rows,cols,bitsAlloc,bitsStored,pixelRep,spp){
+  /* JPEG Lossless (most common for dental CBCT) */
+  if(ts===TS_JPEG_LOSSLESS || ts===TS_JPEG_LOSSLESS_P14){
+    return decodeJPEGLossless(frameData,rows*cols*spp,bitsAlloc,pixelRep);
+  }
+  /* JPEG Baseline/Extended */
+  if(ts===TS_JPEG_BASELINE || ts===TS_JPEG_EXTENDED){
+    return decodeJPEGBaseline(frameData,rows,cols,bitsAlloc,pixelRep,spp);
+  }
+  /* RLE Lossless */
+  if(ts===TS_RLE){
+    return decodeRLE(frameData,rows,cols,bitsAlloc,pixelRep,spp);
+  }
+  /* JPEG 2000 */
+  if(ts===TS_JPEG2K_LOSSLESS || ts===TS_JPEG2K){
+    throw new Error('JPEG 2000 compressed DICOM detected. This format is not yet supported in DentView. Please export your scan as Uncompressed or JPEG Lossless from your CBCT software (Planmeca Romexis, Carestream, iCAT, etc).');
+  }
+  /* JPEG-LS */
+  if(ts===TS_JPEGLS_LOSSLESS || ts===TS_JPEGLS){
+    throw new Error('JPEG-LS compressed DICOM detected. This format is not yet supported. Please export as Uncompressed or JPEG Lossless.');
+  }
+  throw new Error('Unsupported transfer syntax: '+ts+'. Please export as Uncompressed DICOM.');
+}
 function parseSingleDicom(bytes){
   var ds=dicomParser.parseDicom(bytes);
   var rows=ds.uint16('x00280010');
@@ -173,19 +330,40 @@ function parseSingleDicom(bytes){
   var imgOrientStr=null;
   try{imgOrientStr=ds.string('x00200037');}catch(e){}
 
+  /* Transfer syntax detection */
+  var transferSyntax='';
+  try{transferSyntax=(ds.string('x00020010')||'').trim();}catch(e){}
+
   var pixelDataEl=ds.elements.x7fe00010;
   if(!pixelDataEl) return null;
 
   var pixelData;
-  if(bitsAlloc<=8){
-    pixelData=new Uint8Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length);
-  }else if(bitsAlloc<=16){
-    if(pixelRep===1){
-      pixelData=new Int16Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length/2);
-    }else{
-      pixelData=new Uint16Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length/2);
+  var isEncapsulated=!!(pixelDataEl.encapsulatedPixelData || 
+    (pixelDataEl.fragments && pixelDataEl.fragments.length>0) ||
+    (transferSyntax && isEncapsulatedTS(transferSyntax)));
+
+  if(isEncapsulated && pixelDataEl.fragments && pixelDataEl.fragments.length>0){
+    /* Compressed DICOM - extract and decode */
+    var frameData=extractEncapsulatedFrame(ds,pixelDataEl);
+    if(!frameData) return null;
+    try{
+      pixelData=decodeCompressedFrame(frameData,transferSyntax,rows,cols,bitsAlloc,bitsStored,pixelRep,samplesPerPixel);
+    }catch(decodeErr){
+      throw decodeErr; /* Propagate decode errors with helpful messages */
     }
-  }else{return null;}
+    if(!pixelData) return null;
+  }else{
+    /* Uncompressed DICOM */
+    if(bitsAlloc<=8){
+      pixelData=new Uint8Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length);
+    }else if(bitsAlloc<=16){
+      if(pixelRep===1){
+        pixelData=new Int16Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length/2);
+      }else{
+        pixelData=new Uint16Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length/2);
+      }
+    }else{return null;}
+  }
 
   var frameSize=rows*cols*samplesPerPixel;
   var minV=Infinity,maxV=-Infinity;
@@ -521,6 +699,15 @@ function buildVolume(){
   volIntercept=first.rescaleIntercept;
   volWL={center:series[Math.floor(series.length/2)].wl.center,width:series[Math.floor(series.length/2)].wl.width};
 
+  /* Estimate memory usage */
+  var bytesPerPixel=(first.bitsAllocated||16)/8;
+  var sliceBytes=volCols*volRows*bytesPerPixel;
+  var totalMB=Math.round((sliceBytes*volSlices)/(1024*1024));
+  if(totalMB>400 && !memoryWarned){
+    memoryWarned=true;
+    sendMsg('memoryWarning',{totalMB:totalMB,slices:volSlices,suggestion:'Large volume ('+totalMB+'MB). Performance may be limited on this device.'});
+  }
+
   /* Check all slices have same dimensions */
   for(var i=1;i<series.length;i++){
     if(series[i].imgData.columns!==volCols||series[i].imgData.rows!==volRows){
@@ -531,6 +718,7 @@ function buildVolume(){
 
   /* No data copy — MPR functions read from series[z].imgData.pixelData directly */
   volume=true;  /* flag that volume is available */
+  panoCache=null; /* invalidate panoramic cache */
   hideProgress();
 }
 
@@ -582,54 +770,97 @@ function reconstructSagittal(xPos){
 
 function reconstructPanoramic(){
   if(!volume) return null;
-  /* Panoramic: curved planar reformation along dental arch.
-   * Traces a U-shaped parabolic curve through the axial plane,
-   * at each point samples a vertical column through all Z slices.
-   * The curve approximates the dental arch shape. */
-  var cx=Math.floor(volCols/2);
-  var cy=Math.floor(volRows*0.55);
-  var archWidth=Math.floor(volCols*0.35);
-  var archDepth=Math.floor(volRows*0.25);
+  /* Return cached version if available */
+  if(panoCache) return panoCache;
 
-  var numSamples=Math.floor(volCols*0.8);
+  /* Panoramic: curved planar reformation along dental arch.
+   * Step 1: Auto-detect arch center from a mid-axial slice
+   * Step 2: Fit a smooth U-shaped curve to the high-density region
+   * Step 3: Sample along the curve through all Z slices */
+
+  /* Find arch parameters from mid-slice intensity distribution */
+  var midZ=Math.floor(volSlices*0.45); /* crown level */
+  var midSlice=series[midZ].imgData.pixelData;
+  var slope=series[midZ].imgData.rescaleSlope||1;
+  var intercept=series[midZ].imgData.rescaleIntercept||0;
+
+  /* Compute row and column intensity profiles to find arch center */
+  var colProfile=new Float32Array(volCols);
+  var rowProfile=new Float32Array(volRows);
+  for(var y=0;y<volRows;y++){
+    for(var x=0;x<volCols;x++){
+      var val=(midSlice[y*volCols+x]||0)*slope+intercept;
+      if(val>200){ /* threshold above soft tissue */
+        colProfile[x]+=val;
+        rowProfile[y]+=val;
+      }
+    }
+  }
+
+  /* Find center of mass for X (arch center horizontal) */
+  var sumX=0,weightX=0;
+  for(var x=0;x<volCols;x++){sumX+=x*colProfile[x];weightX+=colProfile[x];}
+  var cx=weightX>0?Math.round(sumX/weightX):Math.floor(volCols/2);
+
+  /* Find center of mass for Y (arch center vertical — biased posterior) */
+  var sumY=0,weightY=0;
+  for(var y=Math.floor(volRows*0.3);y<Math.floor(volRows*0.8);y++){
+    sumY+=y*rowProfile[y];weightY+=rowProfile[y];
+  }
+  var cy=weightY>0?Math.round(sumY/weightY):Math.floor(volRows*0.55);
+
+  /* Estimate arch extent from high-intensity spread */
+  var leftX=cx,rightX=cx;
+  var threshold=weightX>0?(weightX/volCols)*0.15:0;
+  for(var x=cx;x>=0;x--){if(colProfile[x]>threshold)leftX=x;else break;}
+  for(var x=cx;x<volCols;x++){if(colProfile[x]>threshold)rightX=x;else break;}
+  var archWidth=Math.max(Math.floor(volCols*0.25),Math.floor((rightX-leftX)*0.55));
+  var archDepth=Math.max(Math.floor(volRows*0.15),Math.floor(archWidth*0.5));
+
+  var numSamples=Math.floor(volCols*0.85);
   var panoWidth=numSamples;
   var panoHeight=volSlices;
   var pixelData=new Int16Array(panoWidth*panoHeight);
 
-  /* Generate arch curve points */
+  /* Generate smooth arch curve — elliptical U-shape */
   var curvePoints=[];
   for(var i=0;i<numSamples;i++){
-    var t=(i/numSamples)-0.5;
+    var t=(i/numSamples)-0.5; /* -0.5 to 0.5 */
     var px=cx+Math.floor(t*2*archWidth);
+    /* Elliptical shape: deeper on sides, flatter in front */
     var py=cy-Math.floor(archDepth*(1-4*t*t));
     px=Math.max(0,Math.min(volCols-1,px));
     py=Math.max(0,Math.min(volRows-1,py));
     curvePoints.push({x:px,y:py});
   }
 
-  /* For each position, average across a band perpendicular to the curve */
-  var thickness=7;
+  /* Sample perpendicular band along the curve for each Z */
+  var thickness=9; /* wider band for better MIP-like effect */
+  var halfT=Math.floor(thickness/2);
   for(var z=0;z<panoHeight;z++){
     var slicePx=series[z].imgData.pixelData;
     for(var s=0;s<panoWidth;s++){
       var cp=curvePoints[s];
-      var sum=0;
-      var count=0;
-      for(var d=-Math.floor(thickness/2);d<=Math.floor(thickness/2);d++){
+      /* Use maximum intensity projection across the band instead of average */
+      var maxVal=-99999;
+      for(var d=-halfT;d<=halfT;d++){
         var sy=cp.y+d;
         if(sy>=0&&sy<volRows){
-          sum+=(slicePx[sy*volCols+cp.x]||0);
-          count++;
+          var v=slicePx[sy*volCols+cp.x]||0;
+          if(v>maxVal) maxVal=v;
         }
       }
-      pixelData[z*panoWidth+s]=count>0?Math.round(sum/count):0;
+      pixelData[z*panoWidth+s]=maxVal>-99999?maxVal:0;
     }
   }
 
-  return {pixelData:pixelData,rows:panoHeight,columns:panoWidth,
+  var result={pixelData:pixelData,rows:panoHeight,columns:panoWidth,
     bitsAllocated:16,bitsStored:16,pixelRep:1,photometric:'MONOCHROME2',
     rescaleSlope:volSlope,rescaleIntercept:volIntercept,
     minVal:-1000,maxVal:3000,samplesPerPixel:1};
+
+  panoCache=result; /* Cache for instant re-access */
+  return result;
 }
 
 /* ── Set View Mode ── */
@@ -1238,7 +1469,65 @@ function handleCommand(cmd){
       mprSlice=Math.max(0,Math.min(mprTotal-1,cmd.index));
       if(viewMode!=='axial') activateMPR();
       break;
+    case 'exportView':
+      exportCurrentView();
+      break;
   }
+}
+
+/* ── Export Current View ── */
+function exportCurrentView(){
+  if(!img) return;
+  /* Create a high-res export canvas with annotations */
+  var exportCanvas=document.createElement('canvas');
+  exportCanvas.width=canvas.width;
+  exportCanvas.height=canvas.height;
+  var ectx=exportCanvas.getContext('2d');
+
+  /* Draw background */
+  ectx.fillStyle='#09090b';
+  ectx.fillRect(0,0,exportCanvas.width,exportCanvas.height);
+
+  /* Draw image with current viewport transforms */
+  ectx.save();
+  ectx.translate(exportCanvas.width/2+vp.panX,exportCanvas.height/2+vp.panY);
+  ectx.rotate(vp.rotation*Math.PI/180);
+  ectx.scale(vp.zoom,vp.zoom);
+  ectx.imageSmoothingEnabled=true;
+  ectx.imageSmoothingQuality='high';
+  ectx.drawImage(offCanvas,-img.columns/2,-img.rows/2);
+  ectx.restore();
+
+  /* Draw measurements */
+  for(var m=0;m<allMeasures.length;m++){
+    var ms=allMeasures[m];
+    var p1=imageToScreen(ms.x1,ms.y1);
+    var p2=imageToScreen(ms.x2,ms.y2);
+    ectx.strokeStyle='#06b6d4';ectx.lineWidth=2.5;
+    ectx.beginPath();ectx.moveTo(p1.x,p1.y);ectx.lineTo(p2.x,p2.y);ectx.stroke();
+    ectx.fillStyle='#06b6d4';
+    [p1,p2].forEach(function(p){
+      ectx.beginPath();ectx.arc(p.x,p.y,6,0,Math.PI*2);ectx.fill();
+    });
+    var mx=(p1.x+p2.x)/2;var my=(p1.y+p2.y)/2-14;
+    ectx.font='bold 13px -apple-system,BlinkMacSystemFont,sans-serif';
+    ectx.textAlign='center';ectx.textBaseline='middle';
+    ectx.fillStyle='#22d3ee';
+    ectx.fillText(ms.distance+' mm',mx,my);
+  }
+
+  /* Add info overlay text at bottom */
+  var infoText='DentView';
+  if(series.length>1) infoText+=' · Slice '+(currentSlice+1)+'/'+series.length;
+  if(viewMode!=='axial') infoText+=' · '+viewMode.charAt(0).toUpperCase()+viewMode.slice(1);
+  infoText+=' · WC:'+Math.round(wl.center)+' WW:'+Math.round(wl.width);
+  ectx.font='11px -apple-system,BlinkMacSystemFont,monospace';
+  ectx.fillStyle='rgba(255,255,255,0.5)';
+  ectx.textAlign='left';ectx.textBaseline='bottom';
+  ectx.fillText(infoText,8,exportCanvas.height-8);
+
+  var dataUrl=exportCanvas.toDataURL('image/png');
+  sendMsg('exportedView',{dataUrl:dataUrl});
 }
 
 /* ── Tooth Navigation ── */

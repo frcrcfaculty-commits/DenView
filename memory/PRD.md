@@ -53,7 +53,8 @@ backend/
 ## Future Enhancements
 - Side-by-side image comparison
 - Annotation tools (arrows, circles, text)
-- Export current view as PNG/JPEG
-- CBCT series scrolling with frame slider
+- JPEG 2000 decoder (WASM-based OpenJPEG)
+- JPEG-LS decoder
 - PWA support for offline use
 - Cloud link support (Google Drive, Dropbox)
+- 3D volume rendering (MIP/surface)
