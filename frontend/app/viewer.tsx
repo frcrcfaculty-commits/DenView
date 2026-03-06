@@ -33,7 +33,7 @@ import { ScrollView, Alert } from 'react-native';
 import { useTheme } from './_layout';
 import { fileStore } from '@/src/store/fileStore';
 import { getDicomViewerHtml } from '@/src/utils/dicomViewerHtml';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 let NativeWebView: any = null;
 if (Platform.OS !== 'web') {
@@ -102,12 +102,11 @@ export default function ViewerScreen() {
   const seriesTotalRef = useRef(0);
   const seriesCurrentRef = useRef(0);
   const currentViewModeRef = useRef('axial');
-  const sendCommandRef = useRef(sendCommand);
+  const sendCommandRef = useRef<((cmd: any) => void) | null>(null);
 
   useEffect(() => { seriesTotalRef.current = seriesTotal; }, [seriesTotal]);
   useEffect(() => { seriesCurrentRef.current = seriesCurrent; }, [seriesCurrent]);
   useEffect(() => { currentViewModeRef.current = currentViewMode; }, [currentViewMode]);
-  useEffect(() => { sendCommandRef.current = sendCommand; }, [sendCommand]);
 
   const handleSliderTouch = useCallback((locationX: number) => {
     const w = sliderWidthRef.current;
@@ -118,9 +117,9 @@ export default function ViewerScreen() {
     const targetSlice = Math.round(ratio * (total - 1));
     if (targetSlice !== current) {
       if (currentViewModeRef.current === 'axial') {
-        sendCommandRef.current({ type: 'setSlice', index: targetSlice });
+        sendCommandRef.current?.({ type: 'setSlice', index: targetSlice });
       } else {
-        sendCommandRef.current({ type: 'setMPRSlice', index: targetSlice });
+        sendCommandRef.current?.({ type: 'setMPRSlice', index: targetSlice });
       }
     }
   }, []);
@@ -144,22 +143,32 @@ export default function ViewerScreen() {
 
   const [exporting, setExporting] = useState(false);
 
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+  const isDemo = params.demo === 'true';
+  const fileMode = params.mode || 'single';
+  const fileName = params.fileName || (isDemo ? 'Demo Series' : 'Unknown');
+  const html = getDicomViewerHtml();
+  const isSeries = seriesTotal > 1;
+
   const handleExportImage = useCallback(() => {
     setExporting(true);
-    sendCommand({ type: 'exportView' });
+    sendCommandRef.current?.({ type: 'exportView' });
     // Timeout fallback in case WebView doesn't respond
     setTimeout(() => setExporting(false), 5000);
-  }, [sendCommand]);
+  }, []);
 
   const handleExportedData = useCallback(async (dataUrl: string) => {
     setExporting(false);
+    const curIsSeries = seriesTotalRef.current > 1;
+    const curSlice = seriesCurrentRef.current;
+    const curViewMode = currentViewModeRef.current;
     try {
       if (Platform.OS === 'web') {
         // Web: trigger download
         const link = document.createElement('a');
         link.href = dataUrl;
-        const sliceLabel = isSeries ? `_slice${seriesCurrent + 1}` : '';
-        const viewLabel = currentViewMode !== 'axial' ? `_${currentViewMode}` : '';
+        const sliceLabel = curIsSeries ? `_slice${curSlice + 1}` : '';
+        const viewLabel = curViewMode !== 'axial' ? `_${curViewMode}` : '';
         link.download = `DentView${viewLabel}${sliceLabel}.png`;
         document.body.appendChild(link);
         link.click();
@@ -168,8 +177,8 @@ export default function ViewerScreen() {
       }
       // Native: save to cache then share
       const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-      const sliceLabel = isSeries ? `_slice${seriesCurrent + 1}` : '';
-      const viewLabel = currentViewMode !== 'axial' ? `_${currentViewMode}` : '';
+      const sliceLabel = curIsSeries ? `_slice${curSlice + 1}` : '';
+      const viewLabel = curViewMode !== 'axial' ? `_${curViewMode}` : '';
       const filePath = `${FileSystem.cacheDirectory}DentView${viewLabel}${sliceLabel}.png`;
       await FileSystem.writeAsStringAsync(filePath, base64Data, {
         encoding: FileSystem.EncodingType.Base64,
@@ -186,14 +195,7 @@ export default function ViewerScreen() {
     } catch (err: any) {
       Alert.alert('Export Error', err.message || 'Could not export image');
     }
-  }, [isSeries, seriesCurrent, currentViewMode]);
-
-  const toastOpacity = useRef(new Animated.Value(0)).current;
-  const isDemo = params.demo === 'true';
-  const fileMode = params.mode || 'single';
-  const fileName = params.fileName || (isDemo ? 'Demo Series' : 'Unknown');
-  const html = getDicomViewerHtml();
-  const isSeries = seriesTotal > 1;
+  }, []);
 
   // Build tools list - add Scroll tool if series
   const tools = isSeries
@@ -232,6 +234,9 @@ export default function ViewerScreen() {
       );
     }
   }, []);
+
+  // Keep ref in sync for callbacks that can't take sendCommand as a dependency
+  useEffect(() => { sendCommandRef.current = sendCommand; }, [sendCommand]);
 
   const sendFileData = useCallback(async () => {
     if (isDemo) {
