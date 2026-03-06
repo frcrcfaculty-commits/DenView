@@ -186,36 +186,61 @@ function decodeJPEGLossless(frameData,frameSize,bitsAlloc,pixelRep){
 }
 
 function decodeJPEGBaseline(frameData,rows,cols,bitsAlloc,pixelRep,samplesPerPixel){
-  /* Synchronous decode using off-screen canvas trick via createImageBitmap is async.
-   * Use a simpler approach: build JPEG blob, decode via temporary Image.
-   * Since this must be sync, we do a blocking XHR to a data URI — but that's not reliable.
-   * Instead, we fall back to a direct byte-level JPEG decode for 8-bit grayscale. */
-  
   /* For 8-bit lossy JPEG, the compressed data IS a standard JPEG.
    * Create a blob URL, load via Image, draw to canvas, extract pixels.
-   * This is inherently async. We'll store a promise and render when ready. */
+   * This is inherently async. We return a placeholder and schedule decode. */
   var blob=new Blob([frameData],{type:'image/jpeg'});
   var url=URL.createObjectURL(blob);
   
   /* We return a placeholder and schedule async decode */
   var placeholder=new Int16Array(rows*cols*samplesPerPixel);
+  /* Mark as pending so parseSingleDicom uses sensible defaults */
+  placeholder._jpegPending=true;
   
-  var img=new Image();
-  img.onload=function(){
+  var localImg=new Image();
+  localImg.onload=function(){
     var tc=document.createElement('canvas');
     tc.width=cols;tc.height=rows;
     var tctx=tc.getContext('2d');
-    tctx.drawImage(img,0,0,cols,rows);
+    tctx.drawImage(localImg,0,0,cols,rows);
     var idata=tctx.getImageData(0,0,cols,rows);
+    var minV=Infinity,maxV=-Infinity;
     for(var i=0;i<rows*cols;i++){
-      placeholder[i]=idata.data[i*4]; /* R channel for grayscale */
+      var v=idata.data[i*4]; /* R channel for grayscale */
+      placeholder[i]=v;
+      if(v<minV)minV=v;
+      if(v>maxV)maxV=v;
     }
+    placeholder._jpegPending=false;
     URL.revokeObjectURL(url);
+    
+    /* Update the current slice's imgData min/max if this is the active image */
+    if(img && img.pixelData===placeholder){
+      img.minVal=minV;
+      img.maxVal=maxV;
+      /* Recompute W/L from actual data if still using defaults */
+      var newCenter=(minV+maxV)/2;
+      var newWidth=Math.max(1,maxV-minV);
+      wl.center=newCenter;
+      wl.width=newWidth;
+      sendMsg('wlUpdate',{center:Math.round(wl.center),width:Math.round(wl.width)});
+    }
+    /* Also update the series entry if it exists */
+    for(var s=0;s<series.length;s++){
+      if(series[s].imgData.pixelData===placeholder){
+        series[s].imgData.minVal=minV;
+        series[s].imgData.maxVal=maxV;
+        series[s].wl.center=(minV+maxV)/2;
+        series[s].wl.width=Math.max(1,maxV-minV);
+        break;
+      }
+    }
+    
     /* Re-render after async decode completes */
     renderWindowed();drawFrame();
   };
-  img.onerror=function(){URL.revokeObjectURL(url);};
-  img.src=url;
+  localImg.onerror=function(){URL.revokeObjectURL(url);};
+  localImg.src=url;
   return placeholder;
 }
 
@@ -367,9 +392,15 @@ function parseSingleDicom(bytes){
 
   var frameSize=rows*cols*samplesPerPixel;
   var minV=Infinity,maxV=-Infinity;
-  for(var i=0;i<Math.min(pixelData.length,frameSize);i++){
-    var v=pixelData[i]*rescaleSlope+rescaleIntercept;
-    if(v<minV)minV=v;if(v>maxV)maxV=v;
+  /* For JPEG Baseline async decode, pixelData is zeroed initially */
+  if(pixelData._jpegPending){
+    /* Use 8-bit range defaults until async decode completes */
+    minV=0;maxV=255;
+  }else{
+    for(var i=0;i<Math.min(pixelData.length,frameSize);i++){
+      var v=pixelData[i]*rescaleSlope+rescaleIntercept;
+      if(v<minV)minV=v;if(v>maxV)maxV=v;
+    }
   }
 
   var patName='Unknown';try{patName=ds.string('x00100010')||'Unknown';}catch(e){}
