@@ -50,6 +50,11 @@ async function readUriAsBase64(uri: string): Promise<string> {
   });
 }
 
+async function readUriAsBlob(uri: string): Promise<Blob> {
+  const response = await fetch(uri);
+  return response.blob();
+}
+
 export default function HomeScreen() {
   const { isDark, colors, toggle } = useTheme();
   const router = useRouter();
@@ -132,8 +137,13 @@ export default function HomeScreen() {
     setLoading(true);
     setLoadingLabel('Reading file...');
     try {
-      const base64 = await readUriAsBase64(uri);
-      fileStore.setFile(base64, name);
+      if (Platform.OS === 'web') {
+        const blob = await readUriAsBlob(uri);
+        fileStore.setFileBlob(blob, name);
+      } else {
+        const base64 = await readUriAsBase64(uri);
+        fileStore.setFile(base64, name);
+      }
       router.push({ pathname: '/viewer', params: { fileName: name, mode: 'single' } });
     } catch (err: any) {
       Alert.alert('Error', 'Could not read file: ' + err.message);
@@ -147,8 +157,13 @@ export default function HomeScreen() {
     setLoading(true);
     setLoadingLabel('Reading ZIP file...');
     try {
-      const base64 = await readUriAsBase64(uri);
-      fileStore.setZip(base64, name);
+      if (Platform.OS === 'web') {
+        const blob = await readUriAsBlob(uri);
+        fileStore.setZipBlob(blob, name);
+      } else {
+        const base64 = await readUriAsBase64(uri);
+        fileStore.setZip(base64, name);
+      }
       router.push({ pathname: '/viewer', params: { fileName: name, mode: 'zip' } });
     } catch (err: any) {
       Alert.alert('Error', 'Could not read ZIP: ' + err.message);

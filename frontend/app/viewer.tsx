@@ -25,6 +25,7 @@ import {
   Trash2,
   Layers,
 } from 'lucide-react-native';
+import { ScrollView } from 'react-native';
 import { useTheme } from './_layout';
 import { fileStore } from '@/src/store/fileStore';
 import { getDicomViewerHtml } from '@/src/utils/dicomViewerHtml';
@@ -61,8 +62,9 @@ const BASE_TOOLS: { id: ToolId; icon: any; label: string }[] = [
 ];
 
 const WL_PRESETS = [
+  { id: 'dental', label: 'Dental' },
   { id: 'bone', label: 'Bone' },
-  { id: 'soft', label: 'Soft Tissue' },
+  { id: 'soft', label: 'Soft' },
   { id: 'full', label: 'Full Range' },
 ];
 
@@ -82,6 +84,13 @@ export default function ViewerScreen() {
   const [isReady, setIsReady] = useState(false);
   const [seriesTotal, setSeriesTotal] = useState(0);
   const [seriesCurrent, setSeriesCurrent] = useState(0);
+  const [seriesGroupsList, setSeriesGroupsList] = useState<{ name: string; count: number; active: boolean }[]>([]);
+  const [activeGroup, setActiveGroup] = useState('');
+  const [sliceRegion, setSliceRegion] = useState<{ region: string; label: string } | null>(null);
+  const [showToothChart, setShowToothChart] = useState(false);
+  const [highlightedTooth, setHighlightedTooth] = useState<number | null>(null);
+  const [hasVolume, setHasVolume] = useState(false);
+  const [currentViewMode, setCurrentViewMode] = useState('axial');
 
   const toastOpacity = useRef(new Animated.Value(0)).current;
   const isDemo = params.demo === 'true';
@@ -101,6 +110,9 @@ export default function ViewerScreen() {
     }
   }, []);
 
+  // Track iframe loaded state for web
+  const [iframeLoaded, setIframeLoaded] = useState(false);
+
   // Web: listen for iframe messages
   useEffect(() => {
     if (Platform.OS !== 'web') return;
@@ -108,7 +120,7 @@ export default function ViewerScreen() {
       if (typeof event.data === 'string') {
         try {
           handleIncomingMessage(JSON.parse(event.data));
-        } catch {}
+        } catch { }
       }
     };
     window.addEventListener('message', handler);
@@ -125,7 +137,7 @@ export default function ViewerScreen() {
     }
   }, []);
 
-  const sendFileData = useCallback(() => {
+  const sendFileData = useCallback(async () => {
     if (isDemo) {
       sendCommand({ type: 'loadDemo' });
       return;
@@ -134,6 +146,15 @@ export default function ViewerScreen() {
     const mode = fileStore.getMode();
 
     if (mode === 'zip') {
+      // Check for blob data first (web path — avoids base64 for large files)
+      const blob = fileStore.getBlobData();
+      if (blob && Platform.OS === 'web') {
+        const buffer = await blob.arrayBuffer();
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'loadZipBuffer', buffer: buffer }, '*'
+        );
+        return;
+      }
       const data = fileStore.getData();
       if (!data) return;
       if (Platform.OS === 'web') {
@@ -141,9 +162,26 @@ export default function ViewerScreen() {
           JSON.stringify({ type: 'loadZip', base64: data }), '*'
         );
       } else {
-        nativeWebViewRef.current?.injectJavaScript(
-          `window.handleCommand({ type: 'loadZip', base64: '${data}' }); true;`
-        );
+        // For native, chunk the base64 to avoid string length limits
+        const CHUNK_SIZE = 512 * 1024;
+        if (data.length > CHUNK_SIZE) {
+          nativeWebViewRef.current?.injectJavaScript(
+            `window._zipChunks = []; true;`
+          );
+          for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+            const chunk = data.slice(i, i + CHUNK_SIZE);
+            nativeWebViewRef.current?.injectJavaScript(
+              `window._zipChunks.push('${chunk}'); true;`
+            );
+          }
+          nativeWebViewRef.current?.injectJavaScript(
+            `window.handleCommand({ type: 'loadZip', base64: window._zipChunks.join('') }); window._zipChunks = null; true;`
+          );
+        } else {
+          nativeWebViewRef.current?.injectJavaScript(
+            `window.handleCommand({ type: 'loadZip', base64: '${data}' }); true;`
+          );
+        }
       }
     } else if (mode === 'multi') {
       const files = fileStore.getMultiData();
@@ -153,11 +191,25 @@ export default function ViewerScreen() {
           JSON.stringify({ type: 'loadMultiDicom', files }), '*'
         );
       } else {
+        for (const file of files) {
+          nativeWebViewRef.current?.injectJavaScript(
+            `window.handleCommand({ type: 'loadMultiDicomChunk', base64: '${file.data}', name: ${JSON.stringify(file.name)} }); true;`
+          );
+        }
         nativeWebViewRef.current?.injectJavaScript(
-          `window.handleCommand(${JSON.stringify({ type: 'loadMultiDicom', files })}); true;`
+          `window.handleCommand({ type: 'loadMultiDicomFinalize' }); true;`
         );
       }
     } else {
+      // Single file
+      const blob = fileStore.getBlobData();
+      if (blob && Platform.OS === 'web') {
+        const buffer = await blob.arrayBuffer();
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'loadDicomBuffer', buffer: buffer }, '*'
+        );
+        return;
+      }
       const data = fileStore.getData();
       if (!data) return;
       if (Platform.OS === 'web') {
@@ -165,9 +217,25 @@ export default function ViewerScreen() {
           JSON.stringify({ type: 'loadDicom', base64: data }), '*'
         );
       } else {
-        nativeWebViewRef.current?.injectJavaScript(
-          `window.handleCommand({ type: 'loadDicom', base64: '${data}' }); true;`
-        );
+        const CHUNK_SIZE = 512 * 1024;
+        if (data.length > CHUNK_SIZE) {
+          nativeWebViewRef.current?.injectJavaScript(
+            `window._dicomChunks = []; true;`
+          );
+          for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+            const chunk = data.slice(i, i + CHUNK_SIZE);
+            nativeWebViewRef.current?.injectJavaScript(
+              `window._dicomChunks.push('${chunk}'); true;`
+            );
+          }
+          nativeWebViewRef.current?.injectJavaScript(
+            `window.handleCommand({ type: 'loadDicom', base64: window._dicomChunks.join('') }); window._dicomChunks = null; true;`
+          );
+        } else {
+          nativeWebViewRef.current?.injectJavaScript(
+            `window.handleCommand({ type: 'loadDicom', base64: '${data}' }); true;`
+          );
+        }
       }
     }
   }, [isDemo, sendCommand]);
@@ -186,9 +254,27 @@ export default function ViewerScreen() {
         break;
       case 'seriesLoaded':
         setSeriesTotal(msg.data.count);
-        setSeriesCurrent(0);
+        break;
+      case 'seriesGroups':
+        setSeriesGroupsList(msg.data.groups);
+        setActiveGroup(msg.data.active);
         break;
       case 'seriesInfo':
+        setSeriesTotal(msg.data.total);
+        setSeriesCurrent(msg.data.current);
+        if (msg.data.region) {
+          setSliceRegion({ region: msg.data.region, label: msg.data.regionLabel });
+        }
+        break;
+      case 'toothNavigated':
+        setHighlightedTooth(msg.data.tooth);
+        setTimeout(() => setHighlightedTooth(null), 2000);
+        break;
+      case 'volumeReady':
+        setHasVolume(msg.data.hasVolume);
+        break;
+      case 'viewModeChanged':
+        setCurrentViewMode(msg.data.mode);
         setSeriesTotal(msg.data.total);
         setSeriesCurrent(msg.data.current);
         break;
@@ -207,7 +293,7 @@ export default function ViewerScreen() {
   const handleNativeMessage = useCallback((event: any) => {
     try {
       handleIncomingMessage(JSON.parse(event.nativeEvent.data));
-    } catch {}
+    } catch { }
   }, [handleIncomingMessage]);
 
   useEffect(() => {
@@ -215,6 +301,18 @@ export default function ViewerScreen() {
       setTimeout(() => sendFileData(), 200);
     }
   }, [isReady, sendFileData]);
+
+  // Web: handle iframe load event
+  const handleIframeLoad = useCallback(() => {
+    setIframeLoaded(true);
+    // On web, the WebView's init() sends 'ready' message.
+    // But if we missed it (race condition), re-send after a short delay
+    setTimeout(() => {
+      if (!isReady) {
+        setIsReady(true);
+      }
+    }, 500);
+  }, [isReady]);
 
   const showMeasureToastFn = (text: string) => {
     setMeasureToast(text);
@@ -246,6 +344,44 @@ export default function ViewerScreen() {
   const goNextSlice = () => sendCommand({ type: 'nextSlice' });
   const goPrevSlice = () => sendCommand({ type: 'prevSlice' });
 
+  const handleSwitchSeries = (groupName: string) => {
+    setActiveGroup(groupName);
+    sendCommand({ type: 'switchSeries', group: groupName });
+  };
+
+  const handleToothTap = (toothNum: number) => {
+    setHighlightedTooth(toothNum);
+    sendCommand({ type: 'navigateToTooth', tooth: toothNum });
+  };
+
+  const handleViewMode = (mode: string) => {
+    setCurrentViewMode(mode);
+    sendCommand({ type: 'setViewMode', mode });
+  };
+
+  const VIEW_MODES = [
+    { id: 'axial', label: 'Axial' },
+    { id: 'coronal', label: 'Coronal' },
+    { id: 'sagittal', label: 'Sagittal' },
+    { id: 'panoramic', label: 'Panoramic' },
+  ];
+
+  // FDI tooth numbering
+  const UPPER_RIGHT = [18, 17, 16, 15, 14, 13, 12, 11]; // patient's right
+  const UPPER_LEFT = [21, 22, 23, 24, 25, 26, 27, 28]; // patient's left
+  const LOWER_LEFT = [31, 32, 33, 34, 35, 36, 37, 38];
+  const LOWER_RIGHT = [48, 47, 46, 45, 44, 43, 42, 41];
+
+  const getToothQuadrant = (tooth: number) => Math.floor(tooth / 10);
+  const isToothInRegion = (tooth: number) => {
+    if (!sliceRegion) return false;
+    const q = getToothQuadrant(tooth);
+    if ((q === 1 || q === 2) && (sliceRegion.region === 'maxilla')) return true;
+    if ((q === 3 || q === 4) && (sliceRegion.region === 'mandible')) return true;
+    if (sliceRegion.region === 'crown') return true;
+    return false;
+  };
+
   const formatDate = (d: string) => {
     if (!d || d === 'Unknown' || d.length < 8) return d;
     return d.slice(0, 4) + '-' + d.slice(4, 6) + '-' + d.slice(6, 8);
@@ -261,7 +397,11 @@ export default function ViewerScreen() {
           <ChevronLeft size={24} color="#fafafa" />
         </TouchableOpacity>
         <View style={s.topTitleWrap}>
-          <Text style={s.topTitle} numberOfLines={1}>{fileName}</Text>
+          <Text style={s.topTitle} numberOfLines={1}>
+            {metadata?.patientName && metadata.patientName !== 'Unknown'
+              ? metadata.patientName.split('^')[0].replace(/,/g, ', ')
+              : fileName}
+          </Text>
           {metadata && (
             <Text style={s.topSubtitle}>
               {metadata.modality} · {metadata.columns}×{metadata.rows}
@@ -279,6 +419,58 @@ export default function ViewerScreen() {
         </TouchableOpacity>
       </View>
 
+      {/* Series Group Selector */}
+      {seriesGroupsList.length > 1 && (
+        <View style={s.seriesGroupRow}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.seriesGroupScroll}>
+            {seriesGroupsList.map((g) => (
+              <TouchableOpacity
+                key={g.name}
+                testID={`series-group-${g.name}-btn`}
+                onPress={() => handleSwitchSeries(g.name)}
+                style={[
+                  s.seriesGroupChip,
+                  g.name === activeGroup && s.seriesGroupChipActive,
+                ]}
+                activeOpacity={0.7}
+              >
+                <Text
+                  style={[
+                    s.seriesGroupText,
+                    g.name === activeGroup && s.seriesGroupTextActive,
+                  ]}
+                >
+                  {g.name} ({g.count})
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+        </View>
+      )}
+
+      {/* View Mode Selector */}
+      {hasVolume && (
+        <View style={s.viewModeRow}>
+          {VIEW_MODES.map((vm) => (
+            <TouchableOpacity
+              key={vm.id}
+              testID={`viewmode-${vm.id}-btn`}
+              onPress={() => handleViewMode(vm.id)}
+              style={[
+                s.viewModeChip,
+                currentViewMode === vm.id && s.viewModeChipActive,
+              ]}
+              activeOpacity={0.7}
+            >
+              <Text style={[
+                s.viewModeText,
+                currentViewMode === vm.id && s.viewModeTextActive,
+              ]}>{vm.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+      )}
+
       {/* Viewer */}
       <View style={s.webViewContainer}>
         {Platform.OS === 'web' ? (
@@ -288,6 +480,7 @@ export default function ViewerScreen() {
             data-testid="dicom-webview"
             style={{ width: '100%', height: '100%', border: 'none', backgroundColor: '#09090b' }}
             sandbox="allow-scripts allow-same-origin"
+            onLoad={handleIframeLoad}
           />
         ) : NativeWebView ? (
           <NativeWebView
@@ -411,6 +604,141 @@ export default function ViewerScreen() {
         </View>
       )}
 
+      {/* Region indicator + Tooth chart toggle */}
+      {isSeries && seriesTotal > 10 && (
+        <View style={s.regionRow}>
+          {sliceRegion && (
+            <View style={s.regionPill}>
+              <Text style={s.regionPillText}>{sliceRegion.label}</Text>
+            </View>
+          )}
+          <TouchableOpacity
+            testID="tooth-chart-toggle"
+            onPress={() => setShowToothChart(!showToothChart)}
+            style={[s.toothChartToggle, showToothChart && s.toothChartToggleActive]}
+            activeOpacity={0.7}
+          >
+            <Text style={[s.toothChartToggleText, showToothChart && { color: '#06b6d4' }]}>
+              {showToothChart ? '▼ Teeth' : '▲ Teeth'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Interactive Tooth Chart */}
+      {showToothChart && isSeries && (
+        <View style={s.toothChart}>
+          {/* Upper arch */}
+          <View style={s.toothArchRow}>
+            <View style={s.toothHalf}>
+              {UPPER_RIGHT.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  testID={`tooth-${t}-btn`}
+                  onPress={() => handleToothTap(t)}
+                  style={[
+                    s.toothBtn,
+                    isToothInRegion(t) && s.toothBtnInRegion,
+                    highlightedTooth === t && s.toothBtnHighlighted,
+                  ]}
+                  activeOpacity={0.6}
+                >
+                  <Text style={[
+                    s.toothBtnText,
+                    isToothInRegion(t) && s.toothBtnTextInRegion,
+                    highlightedTooth === t && s.toothBtnTextHighlighted,
+                  ]}>{t}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <View style={s.archDivider} />
+            <View style={s.toothHalf}>
+              {UPPER_LEFT.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  testID={`tooth-${t}-btn`}
+                  onPress={() => handleToothTap(t)}
+                  style={[
+                    s.toothBtn,
+                    isToothInRegion(t) && s.toothBtnInRegion,
+                    highlightedTooth === t && s.toothBtnHighlighted,
+                  ]}
+                  activeOpacity={0.6}
+                >
+                  <Text style={[
+                    s.toothBtnText,
+                    isToothInRegion(t) && s.toothBtnTextInRegion,
+                    highlightedTooth === t && s.toothBtnTextHighlighted,
+                  ]}>{t}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+          {/* Arch labels */}
+          <View style={s.archLabelRow}>
+            <Text style={s.archLabel}>R</Text>
+            <View style={s.archLabelLine} />
+            <Text style={s.archLabelCenter}>Upper</Text>
+            <View style={s.archLabelLine} />
+            <Text style={s.archLabel}>L</Text>
+          </View>
+          <View style={s.archSeparator} />
+          <View style={s.archLabelRow}>
+            <Text style={s.archLabel}>R</Text>
+            <View style={s.archLabelLine} />
+            <Text style={s.archLabelCenter}>Lower</Text>
+            <View style={s.archLabelLine} />
+            <Text style={s.archLabel}>L</Text>
+          </View>
+          {/* Lower arch */}
+          <View style={s.toothArchRow}>
+            <View style={s.toothHalf}>
+              {LOWER_RIGHT.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  testID={`tooth-${t}-btn`}
+                  onPress={() => handleToothTap(t)}
+                  style={[
+                    s.toothBtn,
+                    isToothInRegion(t) && s.toothBtnInRegion,
+                    highlightedTooth === t && s.toothBtnHighlighted,
+                  ]}
+                  activeOpacity={0.6}
+                >
+                  <Text style={[
+                    s.toothBtnText,
+                    isToothInRegion(t) && s.toothBtnTextInRegion,
+                    highlightedTooth === t && s.toothBtnTextHighlighted,
+                  ]}>{t}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <View style={s.archDivider} />
+            <View style={s.toothHalf}>
+              {LOWER_LEFT.map((t) => (
+                <TouchableOpacity
+                  key={t}
+                  testID={`tooth-${t}-btn`}
+                  onPress={() => handleToothTap(t)}
+                  style={[
+                    s.toothBtn,
+                    isToothInRegion(t) && s.toothBtnInRegion,
+                    highlightedTooth === t && s.toothBtnHighlighted,
+                  ]}
+                  activeOpacity={0.6}
+                >
+                  <Text style={[
+                    s.toothBtnText,
+                    isToothInRegion(t) && s.toothBtnTextInRegion,
+                    highlightedTooth === t && s.toothBtnTextHighlighted,
+                  ]}>{t}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+        </View>
+      )}
+
       {/* Toolbar */}
       <View style={s.toolbar}>
         <View style={s.toolbarInner}>
@@ -522,4 +850,91 @@ const styles = StyleSheet.create({
   },
   toolBtnActive: { backgroundColor: 'rgba(6,182,212,0.1)' },
   toolLabel: { fontSize: 9, fontWeight: '600', marginTop: 2 },
+  seriesGroupRow: {
+    flexDirection: 'row', backgroundColor: 'rgba(9,9,11,0.95)',
+    borderBottomWidth: 1, borderBottomColor: '#1a1a1e',
+    paddingVertical: 6, paddingHorizontal: 8,
+  },
+  seriesGroupScroll: { gap: 8, paddingHorizontal: 4 },
+  seriesGroupChip: {
+    paddingHorizontal: 16, paddingVertical: 7, borderRadius: 20,
+    backgroundColor: '#18181b', borderWidth: 1, borderColor: '#27272a',
+  },
+  seriesGroupChipActive: {
+    backgroundColor: 'rgba(6,182,212,0.15)', borderColor: '#06b6d4',
+  },
+  seriesGroupText: {
+    color: '#71717a', fontSize: 12, fontWeight: '600',
+  },
+  seriesGroupTextActive: {
+    color: '#06b6d4',
+  },
+  // Region indicator
+  regionRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 12, paddingVertical: 5,
+    backgroundColor: 'rgba(9,9,11,0.95)', borderTopWidth: 1, borderTopColor: '#1a1a1e',
+  },
+  regionPill: {
+    backgroundColor: 'rgba(6,182,212,0.1)', borderWidth: 1, borderColor: 'rgba(6,182,212,0.3)',
+    borderRadius: 12, paddingHorizontal: 10, paddingVertical: 3,
+  },
+  regionPillText: { color: '#22d3ee', fontSize: 10, fontWeight: '600' },
+  toothChartToggle: {
+    paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12,
+    backgroundColor: '#18181b', borderWidth: 1, borderColor: '#27272a',
+  },
+  toothChartToggleActive: {
+    backgroundColor: 'rgba(6,182,212,0.1)', borderColor: '#06b6d4',
+  },
+  toothChartToggleText: { color: '#71717a', fontSize: 10, fontWeight: '700' },
+  // Tooth chart
+  toothChart: {
+    backgroundColor: 'rgba(9,9,11,0.98)', paddingHorizontal: 6, paddingVertical: 8,
+    borderTopWidth: 1, borderTopColor: '#1a1a1e',
+  },
+  toothArchRow: {
+    flexDirection: 'row', justifyContent: 'center', alignItems: 'center',
+  },
+  toothHalf: {
+    flexDirection: 'row', gap: 2, flex: 1, justifyContent: 'center',
+  },
+  archDivider: {
+    width: 2, height: 28, backgroundColor: '#27272a', marginHorizontal: 2,
+  },
+  toothBtn: {
+    width: 28, height: 28, borderRadius: 6, alignItems: 'center', justifyContent: 'center',
+    backgroundColor: '#18181b', borderWidth: 1, borderColor: '#27272a',
+  },
+  toothBtnInRegion: {
+    backgroundColor: 'rgba(6,182,212,0.08)', borderColor: 'rgba(6,182,212,0.3)',
+  },
+  toothBtnHighlighted: {
+    backgroundColor: 'rgba(6,182,212,0.3)', borderColor: '#06b6d4', borderWidth: 2,
+  },
+  toothBtnText: { color: '#52525b', fontSize: 8, fontWeight: '700' },
+  toothBtnTextInRegion: { color: '#22d3ee' },
+  toothBtnTextHighlighted: { color: '#ffffff' },
+  archLabelRow: {
+    flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, marginVertical: 2,
+  },
+  archLabel: { color: '#3f3f46', fontSize: 9, fontWeight: '700', width: 12, textAlign: 'center' },
+  archLabelLine: { flex: 1, height: 1, backgroundColor: '#1a1a1e' },
+  archLabelCenter: { color: '#3f3f46', fontSize: 8, fontWeight: '600', marginHorizontal: 6 },
+  archSeparator: { height: 1, backgroundColor: '#27272a', marginHorizontal: 16, marginVertical: 3 },
+  // View mode selector
+  viewModeRow: {
+    flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingVertical: 6,
+    backgroundColor: 'rgba(9,9,11,0.95)', borderBottomWidth: 1, borderBottomColor: '#1a1a1e',
+    justifyContent: 'center',
+  },
+  viewModeChip: {
+    paddingHorizontal: 16, paddingVertical: 7, borderRadius: 20,
+    backgroundColor: '#18181b', borderWidth: 1, borderColor: '#27272a',
+  },
+  viewModeChipActive: {
+    backgroundColor: 'rgba(6,182,212,0.15)', borderColor: '#06b6d4',
+  },
+  viewModeText: { color: '#71717a', fontSize: 12, fontWeight: '600' },
+  viewModeTextActive: { color: '#06b6d4' },
 });

@@ -14,24 +14,28 @@ html,body{width:100%;height:100%;overflow:hidden;background:#09090b;touch-action
 @keyframes spin{to{transform:rotate(360deg);}}
 .hidden{display:none!important;}
 #sliceInfo{position:absolute;bottom:8px;left:50%;transform:translateX(-50%);color:#06b6d4;font-family:-apple-system,BlinkMacSystemFont,monospace;font-size:13px;font-weight:600;background:rgba(9,9,11,0.85);padding:4px 14px;border-radius:12px;border:1px solid #27272a;pointer-events:none;z-index:10;}
-#progressBar{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:260px;background:rgba(24,24,27,0.95);border:1px solid #27272a;border-radius:12px;padding:20px;z-index:110;display:none;flex-direction:column;align-items:center;gap:10px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
+#progressBar{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:280px;background:rgba(24,24,27,0.95);border:1px solid #27272a;border-radius:12px;padding:20px;z-index:110;display:none;flex-direction:column;align-items:center;gap:10px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
 #progressBar .bar{width:100%;height:6px;background:#27272a;border-radius:3px;overflow:hidden;}
 #progressBar .fill{height:100%;background:#06b6d4;border-radius:3px;transition:width 0.15s;}
-#progressBar .text{color:#a1a1aa;font-size:13px;}
+#progressBar .text{color:#a1a1aa;font-size:13px;text-align:center;}
+#progressBar .subtext{color:#52525b;font-size:11px;text-align:center;}
 </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
 <div id="loading"><div class="spinner"></div><span id="loadText">Initializing viewer...</span></div>
 <div id="sliceInfo" class="hidden"></div>
-<div id="progressBar"><div class="text" id="progText">Loading...</div><div class="bar"><div class="fill" id="progFill" style="width:0%"></div></div></div>
+<div id="progressBar"><div class="text" id="progText">Loading...</div><div class="subtext" id="progSub"></div><div class="bar"><div class="fill" id="progFill" style="width:0%"></div></div></div>
 <script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
 <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 (function(){
 'use strict';
 
+/* ── State ── */
 var series=[];
+var seriesGroups={};     // { groupName: [parsed slices] }
+var activeGroupName='';
 var currentSlice=0;
 var img=null;
 var vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
@@ -42,6 +46,19 @@ var allMeasures=[];
 var pxSpaceX=1;
 var pxSpaceY=1;
 
+/* ── 3D Volume for MPR ── */
+var volume=null;        // Int16Array: volume[z*volRows*volCols + y*volCols + x]
+var volCols=0;          // width of each axial slice
+var volRows=0;          // height of each axial slice
+var volSlices=0;        // number of axial slices (depth)
+var volSlope=1;
+var volIntercept=0;
+var volWL={center:500,width:2500};
+var viewMode='axial';   // axial | coronal | sagittal | panoramic
+var mprSlice=0;         // current position in coronal/sagittal/panoramic mode
+var mprTotal=0;         // total slices in current MPR mode
+
+/* ── DOM refs ── */
 var canvas=document.getElementById('canvas');
 var ctx=canvas.getContext('2d');
 var loadingEl=document.getElementById('loading');
@@ -49,11 +66,13 @@ var loadText=document.getElementById('loadText');
 var sliceInfoEl=document.getElementById('sliceInfo');
 var progressBar=document.getElementById('progressBar');
 var progText=document.getElementById('progText');
+var progSub=document.getElementById('progSub');
 var progFill=document.getElementById('progFill');
 
 var offCanvas=document.createElement('canvas');
 var offCtx=offCanvas.getContext('2d');
 
+/* ── Init ── */
 function init(){
   resize();
   window.addEventListener('resize',resize);
@@ -68,13 +87,44 @@ function resize(){
   if(img) drawFrame();
 }
 
-function showProgress(text,pct){
+/* ── Progress UI ── */
+function showProgress(text,pct,sub){
   progressBar.style.display='flex';
   progText.textContent=text;
   progFill.style.width=pct+'%';
+  progSub.textContent=sub||'';
 }
 function hideProgress(){progressBar.style.display='none';}
 
+/* ── Base64 → bytes ── */
+function base64ToBytes(base64){
+  try{
+    var raw=atob(base64);
+    var bytes=new Uint8Array(raw.length);
+    for(var i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+    return bytes;
+  }catch(e){
+    throw new Error('Invalid base64 data: '+e.message);
+  }
+}
+
+/* ── Natural numeric sort ── */
+function naturalCompare(a,b){
+  var re=/(\d+)/g;
+  var aParts=a.split(re);
+  var bParts=b.split(re);
+  for(var i=0;i<Math.min(aParts.length,bParts.length);i++){
+    if(aParts[i]!==bParts[i]){
+      var aNum=parseInt(aParts[i]);
+      var bNum=parseInt(bParts[i]);
+      if(!isNaN(aNum)&&!isNaN(bNum)) return aNum-bNum;
+      return aParts[i].localeCompare(bParts[i]);
+    }
+  }
+  return aParts.length-bParts.length;
+}
+
+/* ── DICOM Parser ── */
 function parseSingleDicom(bytes){
   var ds=dicomParser.parseDicom(bytes);
   var rows=ds.uint16('x00280010');
@@ -109,11 +159,19 @@ function parseSingleDicom(bytes){
   try{sliceLoc=parseFloat(ds.string('x00201041'))||0;}catch(e){}
   var imgPosStr=null;
   try{imgPosStr=ds.string('x00200032');}catch(e){}
-  var zPos=0;
+  var zPos=null;  /* null means not available */
+  var xPos=0,yPos=0;
   if(imgPosStr){
     var parts=imgPosStr.split(String.fromCharCode(92));
-    if(parts.length>=3) zPos=parseFloat(parts[2])||0;
+    xPos=parseFloat(parts[0])||0;
+    yPos=parseFloat(parts[1])||0;
+    if(parts.length>=3) zPos=parseFloat(parts[2]);
+    if(isNaN(zPos)) zPos=null;
   }
+  var sliceThickness=0;
+  try{sliceThickness=parseFloat(ds.string('x00180050'))||0;}catch(e){}
+  var imgOrientStr=null;
+  try{imgOrientStr=ds.string('x00200037');}catch(e){}
 
   var pixelDataEl=ds.elements.x7fe00010;
   if(!pixelDataEl) return null;
@@ -155,27 +213,32 @@ function parseSingleDicom(bytes){
     },
     wl:{center:wc,width:ww},
     pxSpaceX:psx,pxSpaceY:psy,
-    sortKey:instanceNum||sliceLoc||zPos,
+    /* Sort key priority: ImagePositionPatient Z > SliceLocation > InstanceNumber */
+    sortKey:zPos!==null?zPos:(sliceLoc||instanceNum),
+    zPos:zPos,
+    sliceLoc:sliceLoc,
     instanceNum:instanceNum,
+    sliceThickness:sliceThickness,
     meta:{
       patientName:patName,studyDate:studyDate,modality:modality,
       rows:rows,columns:cols,pixelSpacing:psStr||'N/A',
       windowCenter:Math.round(wc),windowWidth:Math.round(ww),
-      frames:1,bitsAllocated:bitsAlloc
+      frames:1,bitsAllocated:bitsAlloc,sliceThickness:sliceThickness
     }
   };
 }
 
+/* ── Single DICOM load ── */
 function loadDicom(base64){
   try{
     loadingEl.className='';
     loadText.textContent='Parsing DICOM...';
-    var raw=atob(base64);
-    var bytes=new Uint8Array(raw.length);
-    for(var i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+    var bytes=base64ToBytes(base64);
     var parsed=parseSingleDicom(bytes);
-    if(!parsed) throw new Error('Could not parse DICOM file');
+    if(!parsed) throw new Error('Could not parse DICOM file. The file may be corrupted or not a valid DICOM.');
     series=[parsed];
+    seriesGroups={};
+    activeGroupName='';
     currentSlice=0;
     activateSlice(0);
     loadingEl.className='hidden';
@@ -185,6 +248,42 @@ function loadDicom(base64){
   }
 }
 
+/* ── Load DICOM from ArrayBuffer (web path - no base64) ── */
+function loadDicomFromBuffer(buffer){
+  try{
+    loadingEl.className='';
+    loadText.textContent='Parsing DICOM...';
+    var bytes=new Uint8Array(buffer);
+    var parsed=parseSingleDicom(bytes);
+    if(!parsed) throw new Error('Could not parse DICOM file.');
+    series=[parsed];
+    seriesGroups={};
+    activeGroupName='';
+    currentSlice=0;
+    activateSlice(0);
+    loadingEl.className='hidden';
+  }catch(e){
+    loadText.textContent='Error: '+e.message;
+    sendMsg('error',{message:e.message});
+  }
+}
+
+/* ── Load ZIP from ArrayBuffer (web path - no base64) ── */
+function loadZipFromBuffer(buffer){
+  loadingEl.className='';
+  loadText.textContent='Extracting ZIP...';
+  showProgress('Extracting ZIP...',0);
+
+  JSZip.loadAsync(buffer).then(function(zip){
+    processZipContents(zip);
+  }).catch(function(e){
+    hideProgress();
+    loadText.textContent='Error reading ZIP: '+e.message;
+    sendMsg('error',{message:'ZIP error: '+e.message});
+  });
+}
+
+/* ── Activate slice ── */
 function activateSlice(idx){
   if(idx<0||idx>=series.length) return;
   currentSlice=idx;
@@ -210,7 +309,8 @@ function activateSlice(idx){
   meta.windowCenter=Math.round(wl.center);
   meta.windowWidth=Math.round(wl.width);
   sendMsg('metadata',meta);
-  sendMsg('seriesInfo',{total:series.length,current:idx});
+  var region=getSliceRegion(idx);
+  sendMsg('seriesInfo',{total:series.length,current:idx,region:region.region,regionLabel:region.label});
 }
 
 function updateSliceInfo(){
@@ -222,22 +322,31 @@ function updateSliceInfo(){
   }
 }
 
+/* ── ZIP loading with progressive parsing ── */
 function loadZip(base64){
   loadingEl.className='';
   loadText.textContent='Extracting ZIP...';
   showProgress('Extracting ZIP...',0);
 
-  var raw=atob(base64);
-  var bytes=new Uint8Array(raw.length);
-  for(var i=0;i<raw.length;i++) bytes[i]=raw.charCodeAt(i);
+  JSZip.loadAsync(base64, {base64: true}).then(function(zip){
+    processZipContents(zip);
+  }).catch(function(e){
+    hideProgress();
+    loadText.textContent='Error reading ZIP: '+e.message;
+    sendMsg('error',{message:'ZIP error: '+e.message});
+  });
+}
 
-  JSZip.loadAsync(bytes).then(function(zip){
+/* ── Shared ZIP processing (used by both loadZip and loadZipFromBuffer) ── */
+function processZipContents(zip){
     var dcmFiles=[];
     zip.forEach(function(path,entry){
       if(entry.dir) return;
       var lower=path.toLowerCase();
+      var baseName=lower.split('/').pop()||'';
+      if(baseName.startsWith('__')||baseName.startsWith('.')) return;
       if(lower.endsWith('.dcm')||lower.endsWith('.dicom')||
-         (!lower.includes('.')&&!lower.startsWith('__')&&!lower.startsWith('.'))){
+         (!baseName.includes('.'))){
         dcmFiles.push({path:path,entry:entry});
       }
     });
@@ -249,40 +358,373 @@ function loadZip(base64){
       return;
     }
 
-    showProgress('Found '+dcmFiles.length+' files. Parsing...',10);
-    var parsed=[];
-    var done=0;
-    var total=dcmFiles.length;
+    /* Sort files by natural numeric order for consistent slice ordering */
+    dcmFiles.sort(function(a,b){ return naturalCompare(a.path,b.path); });
 
-    function processNext(idx){
-      if(idx>=total){
-        finalizeSeries(parsed);
+    showProgress('Found '+dcmFiles.length+' files...',5,'Parsing slices...');
+
+    /* Group files by directory for series detection */
+    var groups={};
+    for(var g=0;g<dcmFiles.length;g++){
+      var dir=dcmFiles[g].path.replace(/\\/[^\\/]*$/,'');
+      /* Files in root of zip get the top-level folder name or 'Original' */
+      var slashIdx=dir.indexOf('/');
+      if(slashIdx===-1) dir='Original';
+      else{
+        var afterFirst=dir.substring(slashIdx+1);
+        dir=afterFirst||'Original';
+      }
+      if(!groups[dir]) groups[dir]=[];
+      groups[dir].push(dcmFiles[g]);
+    }
+
+    var groupNames=Object.keys(groups);
+    /* Rename 'Original' group if it's the only root folder */
+    if(groupNames.length>=2){
+      /* If we have 'Original' and subdirs like 'VOL_MAR', label nicely */
+      for(var gi=0;gi<groupNames.length;gi++){
+        if(groupNames[gi]==='Original') groupNames[gi]='Original';
+        else if(groupNames[gi].toUpperCase().indexOf('MAR')>=0) groupNames[gi]=groupNames[gi];
+      }
+    }
+
+    /* Parse all groups progressively */
+    var allGroupsParsed={};
+    var totalFiles=dcmFiles.length;
+    var totalDone=0;
+    var firstSliceShown=false;
+
+    function parseGroup(gIdx){
+      if(gIdx>=groupNames.length){
+        finalizeAllGroups(allGroupsParsed,groupNames);
         return;
       }
-      dcmFiles[idx].entry.async('uint8array').then(function(data){
-        try{
-          var result=parseSingleDicom(data);
-          if(result){
-            result.fileName=dcmFiles[idx].path;
-            parsed.push(result);
+      var gName=groupNames[gIdx];
+      var gFiles=groups[gName];
+      var gParsed=[];
+
+      function parseNext(fIdx){
+        if(fIdx>=gFiles.length){
+          allGroupsParsed[gName]=gParsed;
+          setTimeout(function(){parseGroup(gIdx+1);},0);
+          return;
+        }
+
+        gFiles[fIdx].entry.async('uint8array').then(function(data){
+          try{
+            var result=parseSingleDicom(data);
+            if(result){
+              result.fileName=gFiles[fIdx].path;
+              gParsed.push(result);
+
+              /* Show first slice immediately */
+              if(!firstSliceShown&&gIdx===0&&gParsed.length===1){
+                firstSliceShown=true;
+                series=[result];
+                currentSlice=0;
+                vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
+                measurePts=[];allMeasures=[];
+                loadingEl.className='hidden';
+                activateSlice(0);
+              }
+            }
+          }catch(e){}
+          totalDone++;
+          var pct=5+Math.round((totalDone/totalFiles)*90);
+          showProgress('Parsing '+(totalDone)+'/'+totalFiles,pct,gName+' · '+(fIdx+1)+'/'+gFiles.length);
+
+          /* Parse in batches to keep UI responsive */
+          if(fIdx%5===4){
+            setTimeout(function(){parseNext(fIdx+1);},0);
+          }else{
+            parseNext(fIdx+1);
           }
-        }catch(e){}
-        done++;
-        var pct=10+Math.round((done/total)*80);
-        showProgress('Parsing '+done+'/'+total+'...',pct);
-        processNext(idx+1);
-      }).catch(function(){
-        done++;
-        processNext(idx+1);
+        }).catch(function(){
+          totalDone++;
+          parseNext(fIdx+1);
+        });
+      }
+      parseNext(0);
+    }
+    parseGroup(0);
+}
+
+/* ── Finalize all series groups ── */
+function finalizeAllGroups(allGroupsParsed,groupNames){
+  hideProgress();
+
+  /* Sort each group by ImagePositionPatient Z (primary), then SliceLocation, then filename */
+  for(var g=0;g<groupNames.length;g++){
+    var parsed=allGroupsParsed[groupNames[g]];
+    parsed.sort(function(a,b){
+      /* Primary: sortKey (IPP Z > SliceLocation > InstanceNumber) */
+      if(a.sortKey!==b.sortKey) return a.sortKey-b.sortKey;
+      /* Fallback: filename natural sort */
+      if(a.fileName&&b.fileName) return naturalCompare(a.fileName,b.fileName);
+      return 0;
+    });
+  }
+
+  seriesGroups=allGroupsParsed;
+
+  /* Default to first group (Original) */
+  var defaultGroup=groupNames[0];
+  activeGroupName=defaultGroup;
+  series=seriesGroups[defaultGroup]||[];
+
+  if(series.length===0){
+    loadText.textContent='No valid DICOM images found';
+    sendMsg('error',{message:'No valid DICOM images found'});
+    return;
+  }
+
+  /* Reset viewport */
+  vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
+  measurePts=[];allMeasures=[];
+
+  /* Build 3D volume from all slices */
+  buildVolume();
+
+  loadingEl.className='hidden';
+
+  /* Navigate to middle slice for CBCT */
+  viewMode='axial';
+  var midSlice=Math.floor(series.length/2);
+  activateSlice(midSlice);
+
+  /* Send series info */
+  sendMsg('seriesLoaded',{count:series.length});
+  sendMsg('volumeReady',{slices:volSlices,rows:volRows,cols:volCols,hasVolume:volume!==null});
+
+  /* Send group info for series selector */
+  if(groupNames.length>1){
+    var groupInfo=[];
+    for(var i=0;i<groupNames.length;i++){
+      groupInfo.push({
+        name:groupNames[i],
+        count:(allGroupsParsed[groupNames[i]]||[]).length,
+        active:groupNames[i]===defaultGroup
       });
     }
-    processNext(0);
-  }).catch(function(e){
-    hideProgress();
-    loadText.textContent='Error reading ZIP: '+e.message;
-    sendMsg('error',{message:'ZIP error: '+e.message});
-  });
+    sendMsg('seriesGroups',{groups:groupInfo,active:defaultGroup});
+  }
 }
+
+/* ── Build 3D Volume metadata from parsed slices (no data copy) ── */
+function buildVolume(){
+  if(!series.length) return;
+  var first=series[0].imgData;
+  volCols=first.columns;
+  volRows=first.rows;
+  volSlices=series.length;
+  volSlope=first.rescaleSlope;
+  volIntercept=first.rescaleIntercept;
+  volWL={center:series[Math.floor(series.length/2)].wl.center,width:series[Math.floor(series.length/2)].wl.width};
+
+  /* Check all slices have same dimensions */
+  for(var i=1;i<series.length;i++){
+    if(series[i].imgData.columns!==volCols||series[i].imgData.rows!==volRows){
+      volume=null;
+      return; /* Mixed dimensions - can't build volume */
+    }
+  }
+
+  /* No data copy — MPR functions read from series[z].imgData.pixelData directly */
+  volume=true;  /* flag that volume is available */
+  hideProgress();
+}
+
+/* ── Read a voxel from the series (no separate volume array) ── */
+function getVoxel(x,y,z){
+  if(z<0||z>=volSlices||y<0||y>=volRows||x<0||x>=volCols) return 0;
+  return series[z].imgData.pixelData[y*volCols+x]||0;
+}
+
+/* ── MPR Reconstruction ── */
+function reconstructCoronal(yPos){
+  if(!volume) return null;
+  /* Coronal: fixed Y, varies X and Z → image is cols × slices */
+  var width=volCols;
+  var height=volSlices;
+  var pixelData=new Int16Array(width*height);
+  var y=Math.max(0,Math.min(volRows-1,yPos));
+  for(var z=0;z<height;z++){
+    var slicePx=series[z].imgData.pixelData;
+    var rowOff=y*volCols;
+    for(var x=0;x<width;x++){
+      pixelData[z*width+x]=slicePx[rowOff+x]||0;
+    }
+  }
+  return {pixelData:pixelData,rows:height,columns:width,
+    bitsAllocated:16,bitsStored:16,pixelRep:1,photometric:'MONOCHROME2',
+    rescaleSlope:volSlope,rescaleIntercept:volIntercept,
+    minVal:-1000,maxVal:3000,samplesPerPixel:1};
+}
+
+function reconstructSagittal(xPos){
+  if(!volume) return null;
+  /* Sagittal: fixed X, varies Y and Z → image is rows × slices */
+  var width=volRows;
+  var height=volSlices;
+  var pixelData=new Int16Array(width*height);
+  var x=Math.max(0,Math.min(volCols-1,xPos));
+  for(var z=0;z<height;z++){
+    var slicePx=series[z].imgData.pixelData;
+    for(var y=0;y<width;y++){
+      pixelData[z*width+y]=slicePx[y*volCols+x]||0;
+    }
+  }
+  return {pixelData:pixelData,rows:height,columns:width,
+    bitsAllocated:16,bitsStored:16,pixelRep:1,photometric:'MONOCHROME2',
+    rescaleSlope:volSlope,rescaleIntercept:volIntercept,
+    minVal:-1000,maxVal:3000,samplesPerPixel:1};
+}
+
+function reconstructPanoramic(){
+  if(!volume) return null;
+  /* Panoramic: curved planar reformation along dental arch.
+   * Traces a U-shaped parabolic curve through the axial plane,
+   * at each point samples a vertical column through all Z slices.
+   * The curve approximates the dental arch shape. */
+  var cx=Math.floor(volCols/2);
+  var cy=Math.floor(volRows*0.55);
+  var archWidth=Math.floor(volCols*0.35);
+  var archDepth=Math.floor(volRows*0.25);
+
+  var numSamples=Math.floor(volCols*0.8);
+  var panoWidth=numSamples;
+  var panoHeight=volSlices;
+  var pixelData=new Int16Array(panoWidth*panoHeight);
+
+  /* Generate arch curve points */
+  var curvePoints=[];
+  for(var i=0;i<numSamples;i++){
+    var t=(i/numSamples)-0.5;
+    var px=cx+Math.floor(t*2*archWidth);
+    var py=cy-Math.floor(archDepth*(1-4*t*t));
+    px=Math.max(0,Math.min(volCols-1,px));
+    py=Math.max(0,Math.min(volRows-1,py));
+    curvePoints.push({x:px,y:py});
+  }
+
+  /* For each position, average across a band perpendicular to the curve */
+  var thickness=7;
+  for(var z=0;z<panoHeight;z++){
+    var slicePx=series[z].imgData.pixelData;
+    for(var s=0;s<panoWidth;s++){
+      var cp=curvePoints[s];
+      var sum=0;
+      var count=0;
+      for(var d=-Math.floor(thickness/2);d<=Math.floor(thickness/2);d++){
+        var sy=cp.y+d;
+        if(sy>=0&&sy<volRows){
+          sum+=(slicePx[sy*volCols+cp.x]||0);
+          count++;
+        }
+      }
+      pixelData[z*panoWidth+s]=count>0?Math.round(sum/count):0;
+    }
+  }
+
+  return {pixelData:pixelData,rows:panoHeight,columns:panoWidth,
+    bitsAllocated:16,bitsStored:16,pixelRep:1,photometric:'MONOCHROME2',
+    rescaleSlope:volSlope,rescaleIntercept:volIntercept,
+    minVal:-1000,maxVal:3000,samplesPerPixel:1};
+}
+
+/* ── Set View Mode ── */
+function setViewMode(mode){
+  if(!volume&&mode!=='axial'){
+    sendMsg('error',{message:'Volume not available. Cannot switch to '+mode+' view.'});
+    return;
+  }
+  viewMode=mode;
+  vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
+  measurePts=[];allMeasures=[];
+
+  if(mode==='axial'){
+    mprTotal=series.length;
+    mprSlice=Math.floor(mprTotal/2);
+    activateSlice(mprSlice);
+    sendMsg('viewModeChanged',{mode:'axial',total:mprTotal,current:mprSlice});
+  }else if(mode==='coronal'){
+    mprTotal=volRows;
+    mprSlice=Math.floor(volRows/2);
+    activateMPR();
+    sendMsg('viewModeChanged',{mode:'coronal',total:mprTotal,current:mprSlice});
+  }else if(mode==='sagittal'){
+    mprTotal=volCols;
+    mprSlice=Math.floor(volCols/2);
+    activateMPR();
+    sendMsg('viewModeChanged',{mode:'sagittal',total:mprTotal,current:mprSlice});
+  }else if(mode==='panoramic'){
+    mprTotal=1;  /* panoramic is a single reconstructed image */
+    mprSlice=0;
+    activateMPR();
+    sendMsg('viewModeChanged',{mode:'panoramic',total:1,current:0});
+  }
+}
+
+function activateMPR(){
+  var reconstructed=null;
+  if(viewMode==='coronal'){
+    reconstructed=reconstructCoronal(mprSlice);
+  }else if(viewMode==='sagittal'){
+    reconstructed=reconstructSagittal(mprSlice);
+  }else if(viewMode==='panoramic'){
+    reconstructed=reconstructPanoramic();
+  }
+  if(!reconstructed){
+    sendMsg('error',{message:'Could not reconstruct '+viewMode+' view'});
+    return;
+  }
+  img=reconstructed;
+  wl={center:volWL.center,width:volWL.width};
+  fitToScreen();
+  renderWindowed();
+  drawFrame();
+  updateSliceInfo();
+  var region=getSliceRegion(viewMode==='axial'?currentSlice:mprSlice);
+  sendMsg('seriesInfo',{total:mprTotal,current:mprSlice,region:region.region,regionLabel:region.label,viewMode:viewMode});
+}
+
+function navigateMPR(delta){
+  if(viewMode==='panoramic') return;  /* panoramic has only 1 view */
+  mprSlice=Math.max(0,Math.min(mprTotal-1,mprSlice+delta));
+  activateMPR();
+}
+
+/* ── Switch between series groups ── */
+function switchSeries(groupName){
+  if(!seriesGroups[groupName]||groupName===activeGroupName) return;
+  activeGroupName=groupName;
+  series=seriesGroups[groupName];
+
+  /* Keep same relative slice position */
+  var relPos=series.length>1?currentSlice/Math.max(1,series.length-1):0;
+  var newIdx=Math.min(Math.round(relPos*(series.length-1)),series.length-1);
+
+  vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
+  measurePts=[];allMeasures=[];
+  activateSlice(Math.max(0,newIdx));
+
+  sendMsg('seriesLoaded',{count:series.length});
+
+  /* Update group active states */
+  var groupNames=Object.keys(seriesGroups);
+  var groupInfo=[];
+  for(var i=0;i<groupNames.length;i++){
+    groupInfo.push({
+      name:groupNames[i],
+      count:seriesGroups[groupNames[i]].length,
+      active:groupNames[i]===groupName
+    });
+  }
+  sendMsg('seriesGroups',{groups:groupInfo,active:groupName});
+}
+
+/* ── Multi-DICOM loading ── */
+var _multiChunkBuffer=[];
 
 function loadMultiDicom(base64Array){
   loadingEl.className='';
@@ -291,24 +733,60 @@ function loadMultiDicom(base64Array){
 
   var parsed=[];
   var total=base64Array.length;
+  var firstShown=false;
 
-  for(var i=0;i<total;i++){
+  function parseNext(i){
+    if(i>=total){
+      finalizeSeries(parsed);
+      return;
+    }
     try{
-      var raw=atob(base64Array[i].data);
-      var bytes=new Uint8Array(raw.length);
-      for(var j=0;j<raw.length;j++) bytes[j]=raw.charCodeAt(j);
+      var bytes=base64ToBytes(base64Array[i].data);
       var result=parseSingleDicom(bytes);
       if(result){
         result.fileName=base64Array[i].name;
         parsed.push(result);
+
+        /* Show first slice immediately */
+        if(!firstShown){
+          firstShown=true;
+          series=[result];
+          currentSlice=0;
+          vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
+          measurePts=[];allMeasures=[];
+          loadingEl.className='hidden';
+          activateSlice(0);
+        }
       }
     }catch(e){}
     var pct=Math.round(((i+1)/total)*90);
     showProgress('Parsing '+(i+1)+'/'+total+'...',pct);
+    if(i%5===4){
+      setTimeout(function(){parseNext(i+1);},0);
+    }else{
+      parseNext(i+1);
+    }
   }
-  finalizeSeries(parsed);
+  parseNext(0);
 }
 
+function loadMultiDicomChunk(base64,name){
+  _multiChunkBuffer.push({data:base64,name:name});
+  loadingEl.className='';
+  loadText.textContent='Receiving file '+_multiChunkBuffer.length+'...';
+}
+
+function loadMultiDicomFinalize(){
+  if(_multiChunkBuffer.length===0){
+    sendMsg('error',{message:'No files received'});
+    return;
+  }
+  var files=_multiChunkBuffer.slice();
+  _multiChunkBuffer=[];
+  loadMultiDicom(files);
+}
+
+/* ── Finalize flat series (non-ZIP multi) ── */
 function finalizeSeries(parsed){
   if(parsed.length===0){
     hideProgress();
@@ -319,24 +797,32 @@ function finalizeSeries(parsed){
 
   showProgress('Sorting '+parsed.length+' slices...',95);
 
-  parsed.sort(function(a,b){
-    if(a.sortKey!==b.sortKey) return a.sortKey-b.sortKey;
-    if(a.fileName&&b.fileName) return a.fileName.localeCompare(b.fileName);
-    return 0;
-  });
+  parsed.sort(function(a,b){\n    /* Primary: sortKey (IPP Z > SliceLocation > InstanceNumber) */\n    if(a.sortKey!==b.sortKey) return a.sortKey-b.sortKey;\n    /* Fallback: filename natural sort */\n    if(a.fileName&&b.fileName) return naturalCompare(a.fileName,b.fileName);\n    return 0;\n  });
 
   series=parsed;
+  seriesGroups={};
+  activeGroupName='';
   currentSlice=0;
   vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
   measurePts=[];allMeasures=[];
 
   hideProgress();
   loadingEl.className='hidden';
-  activateSlice(0);
+
+  /* Navigate to middle slice for CBCT volumes */
+  var midSlice=series.length>10?Math.floor(series.length/2):0;
+
+  /* Build 3D volume for MPR views */
+  buildVolume();
+  viewMode='axial';
+
+  activateSlice(midSlice);
 
   sendMsg('seriesLoaded',{count:series.length});
+  sendMsg('volumeReady',{slices:volSlices,rows:volRows,cols:volCols,hasVolume:volume!==null});
 }
 
+/* ── Viewport helpers ── */
 function fitToScreen(){
   if(!img)return;
   var scaleX=canvas.width/img.columns;
@@ -345,6 +831,7 @@ function fitToScreen(){
   vp.panX=0;vp.panY=0;
 }
 
+/* ── Demo ── */
 function loadDemo(){
   loadingEl.className='';
   loadText.textContent='Generating demo...';
@@ -411,15 +898,24 @@ function loadDemo(){
   }
 
   series=slices;
+  seriesGroups={};
+  activeGroupName='';
   currentSlice=0;
   vp={zoom:1,panX:0,panY:0,rotation:0,inverted:false};
   measurePts=[];allMeasures=[];
 
   loadingEl.className='hidden';
+
+  /* Build 3D volume for MPR views */
+  buildVolume();
+  viewMode='axial';
+
   activateSlice(0);
   sendMsg('seriesLoaded',{count:series.length});
+  sendMsg('volumeReady',{slices:volSlices,rows:volRows,cols:volCols,hasVolume:volume!==null});
 }
 
+/* ── Rendering ── */
 function renderWindowed(){
   if(!img)return;
   offCanvas.width=img.columns;
@@ -474,6 +970,7 @@ function drawFrame(){
   drawMeasurements();
 }
 
+/* ── Measurements ── */
 function drawMeasurements(){
   for(var m=0;m<allMeasures.length;m++){
     var ms=allMeasures[m];
@@ -519,6 +1016,7 @@ function roundRect(c,x,y,w,h,r){
   c.lineTo(x,y+r);c.quadraticCurveTo(x,y,x+r,y);
 }
 
+/* ── Coordinate transforms ── */
 function screenToImage(sx,sy){
   var cx=canvas.width/2+vp.panX;var cy=canvas.height/2+vp.panY;
   var dx=sx-cx;var dy=sy-cy;
@@ -535,6 +1033,7 @@ function imageToScreen(ix,iy){
   return{x:rx+canvas.width/2+vp.panX,y:ry+canvas.height/2+vp.panY};
 }
 
+/* ── Touch / Mouse Input ── */
 var touchState={active:false,lastX:0,lastY:0,lastDist:0,isPinch:false,startTime:0,startX:0,startY:0};
 
 function setupInput(){
@@ -611,10 +1110,14 @@ function onMouseUp(){mouseState.active=false;}
 
 function onWheel(e){
   e.preventDefault();if(!img)return;
-  if(activeTool==='scroll'&&series.length>1){
+  if(activeTool==='scroll'){
     var dir=e.deltaY>0?1:-1;
-    var next=currentSlice+dir;
-    if(next>=0&&next<series.length){activateSlice(next);}
+    if(viewMode==='axial'&&series.length>1){
+      var next=currentSlice+dir;
+      if(next>=0&&next<series.length){activateSlice(next);}
+    }else if(viewMode!=='axial'&&viewMode!=='panoramic'){
+      navigateMPR(dir);
+    }
     return;
   }
   var delta=e.deltaY>0?0.92:1.08;
@@ -633,16 +1136,25 @@ function handleDrag(dx,dy){
     wl.center=wl.center-dy*3;
     renderWindowed();drawFrame();
     sendMsg('wlUpdate',{center:Math.round(wl.center),width:Math.round(wl.width)});
-  }else if(activeTool==='scroll'&&series.length>1){
-    var sensitivity=Math.max(1,Math.round(series.length/canvas.height*2));
-    var sliceDelta=Math.round(dy*sensitivity*0.1);
-    if(Math.abs(sliceDelta)>=1){
-      var next=Math.max(0,Math.min(series.length-1,currentSlice+sliceDelta));
-      if(next!==currentSlice) activateSlice(next);
+  }else if(activeTool==='scroll'){
+    if(viewMode==='axial'&&series.length>1){
+      var sensitivity=Math.max(1,Math.round(series.length/canvas.height*2));
+      var sliceDelta=Math.round(dy*sensitivity*0.1);
+      if(Math.abs(sliceDelta)>=1){
+        var next=Math.max(0,Math.min(series.length-1,currentSlice+sliceDelta));
+        if(next!==currentSlice) activateSlice(next);
+      }
+    }else if(viewMode!=='axial'&&viewMode!=='panoramic'){
+      var mprSensitivity=Math.max(1,Math.round(mprTotal/canvas.height*2));
+      var mprDelta=Math.round(dy*mprSensitivity*0.1);
+      if(Math.abs(mprDelta)>=1){
+        navigateMPR(mprDelta);
+      }
     }
   }
 }
 
+/* ── Measurement ── */
 function addMeasurePoint(pt){
   if(!img)return;
   if(pt.x<0||pt.x>=img.columns||pt.y<0||pt.y>=img.rows)return;
@@ -658,6 +1170,7 @@ function addMeasurePoint(pt){
   drawFrame();
 }
 
+/* ── Command Handler ── */
 function handleCommand(cmd){
   if(!cmd||!cmd.type)return;
   switch(cmd.type){
@@ -665,6 +1178,9 @@ function handleCommand(cmd){
     case 'loadDemo':loadDemo();break;
     case 'loadZip':loadZip(cmd.base64);break;
     case 'loadMultiDicom':loadMultiDicom(cmd.files);break;
+    case 'loadMultiDicomChunk':loadMultiDicomChunk(cmd.base64,cmd.name);break;
+    case 'loadMultiDicomFinalize':loadMultiDicomFinalize();break;
+    case 'switchSeries':switchSeries(cmd.group);break;
     case 'setTool':
       activeTool=cmd.tool;
       if(cmd.tool!=='measure'){measurePts=[];if(img)drawFrame();}
@@ -672,7 +1188,8 @@ function handleCommand(cmd){
       break;
     case 'windowPreset':
       if(!img)break;
-      if(cmd.preset==='bone'){wl.center=500;wl.width=2500;}
+      if(cmd.preset==='dental'){wl.center=1500;wl.width=3000;}
+      else if(cmd.preset==='bone'){wl.center=500;wl.width=2500;}
       else if(cmd.preset==='soft'){wl.center=50;wl.width=400;}
       else if(cmd.preset==='full'){wl.center=(img.minVal+img.maxVal)/2;wl.width=Math.max(1,img.maxVal-img.minVal);}
       renderWindowed();drawFrame();
@@ -689,17 +1206,110 @@ function handleCommand(cmd){
       if(img){fitToScreen();renderWindowed();drawFrame();}
       sendMsg('resetDone',{});break;
     case 'setSlice':
-      if(cmd.index>=0&&cmd.index<series.length) activateSlice(cmd.index);
+      if(viewMode==='axial'){
+        if(cmd.index>=0&&cmd.index<series.length) activateSlice(cmd.index);
+      }else{
+        mprSlice=Math.max(0,Math.min(mprTotal-1,cmd.index));
+        activateMPR();
+      }
       break;
     case 'nextSlice':
-      if(currentSlice<series.length-1) activateSlice(currentSlice+1);break;
+      if(viewMode==='axial'){
+        if(currentSlice<series.length-1) activateSlice(currentSlice+1);
+      }else{
+        navigateMPR(1);
+      }
+      break;
     case 'prevSlice':
-      if(currentSlice>0) activateSlice(currentSlice-1);break;
+      if(viewMode==='axial'){
+        if(currentSlice>0) activateSlice(currentSlice-1);
+      }else{
+        navigateMPR(-1);
+      }
+      break;
     case 'clearMeasurements':
       measurePts=[];allMeasures=[];if(img)drawFrame();break;
+    case 'loadZipBuffer':loadZipFromBuffer(cmd.buffer);break;
+    case 'loadDicomBuffer':loadDicomFromBuffer(cmd.buffer);break;
+    case 'navigateToTooth':navigateToTooth(cmd.tooth);break;
+    case 'getRegionInfo':sendSliceRegionInfo();break;
+    case 'setViewMode':setViewMode(cmd.mode);break;
+    case 'setMPRSlice':
+      mprSlice=Math.max(0,Math.min(mprTotal-1,cmd.index));
+      if(viewMode!=='axial') activateMPR();
+      break;
   }
 }
 
+/* ── Tooth Navigation ── */
+/*
+ * FDI tooth numbering:
+ *   Upper right: 18-11  |  Upper left: 21-28
+ *   Lower right: 48-41  |  Lower left: 31-38
+ *
+ * CBCT axial slices go from top (slice 0 = top of skull) to bottom (slice N = chin).
+ * We divide the volume into anatomical zones based on percentage:
+ *   0-15%: cranial/sinus region (above teeth)
+ *   15-35%: maxillary roots (upper teeth roots)
+ *   35-50%: crown level (where upper and lower teeth crowns meet)
+ *   50-70%: mandibular roots (lower teeth roots)
+ *   70-100%: sub-mandibular region (below teeth)
+ *
+ * Upper teeth (quad 1,2): navigate to ~25% of total slices (upper root zone)
+ * Lower teeth (quad 3,4): navigate to ~60% of total slices (lower root zone)
+ * Within a quadrant, anterior teeth are closer to the center/crown region.
+ */
+function navigateToTooth(toothNum){
+  if(!series.length||series.length<10) return;
+  var total=series.length;
+  var quad=Math.floor(toothNum/10);  // 1=UR, 2=UL, 3=LL, 4=LR
+  var pos=toothNum%10;  // 1=central, 8=third molar
+
+  var slicePercent;
+  if(quad===1||quad===2){
+    // Upper jaw: roots at 15-35%, crowns at 35-50%
+    // Anterior teeth (1-3) closer to crown level, posterior (6-8) closer to roots
+    slicePercent = 0.20 + (pos - 1) * (-0.005);  // range: 0.20 (central) to 0.165 (3rd molar)
+    // Adjust: anterior teeth slightly lower (toward crown), posterior higher (toward root tip)
+    if(pos<=3) slicePercent=0.32;  // anteriors at crown area
+    else if(pos<=5) slicePercent=0.27;  // premolars
+    else slicePercent=0.22;  // molars (deeper roots)
+  } else {
+    // Lower jaw: roots at 50-70%, crowns at 35-50%
+    if(pos<=3) slicePercent=0.52;  // anteriors near crown
+    else if(pos<=5) slicePercent=0.57;  // premolars
+    else slicePercent=0.63;  // molars (deeper roots)
+  }
+
+  var targetSlice=Math.round(total*slicePercent);
+  targetSlice=Math.max(0,Math.min(total-1,targetSlice));
+  activateSlice(targetSlice);
+  sendMsg('toothNavigated',{tooth:toothNum,slice:targetSlice});
+}
+
+function getSliceRegion(idx){
+  if(!series.length) return {region:'unknown',label:'Unknown'};
+  var pct=idx/series.length;
+  if(pct<0.12) return {region:'cranial',label:'Cranial'};
+  if(pct<0.30) return {region:'maxilla',label:'Upper Jaw (Maxilla)'};
+  if(pct<0.48) return {region:'crown',label:'Crown Level'};
+  if(pct<0.68) return {region:'mandible',label:'Lower Jaw (Mandible)'};
+  return {region:'submandibular',label:'Sub-mandibular'};
+}
+
+function sendSliceRegionInfo(){
+  if(!series.length) return;
+  var region=getSliceRegion(currentSlice);
+  sendMsg('sliceRegion',{
+    region:region.region,
+    label:region.label,
+    sliceIndex:currentSlice,
+    totalSlices:series.length,
+    percent:Math.round((currentSlice/series.length)*100)
+  });
+}
+
+/* ── Messaging ── */
 function sendMsg(type,data){
   var msg=JSON.stringify({type:type,data:data});
   try{
@@ -714,6 +1324,9 @@ document.addEventListener('message',function(e){
 window.addEventListener('message',function(e){
   if(typeof e.data==='string'){
     try{handleCommand(JSON.parse(e.data));}catch(err){}
+  } else if(typeof e.data==='object' && e.data !== null && e.data.type){
+    // Handle structured clone messages (e.g. ArrayBuffer from parent)
+    handleCommand(e.data);
   }
 });
 
