@@ -363,21 +363,34 @@ function parseSingleDicom(bytes){
   if(!pixelDataEl) return null;
 
   var pixelData;
-  var isEncapsulated=!!(pixelDataEl.encapsulatedPixelData || 
-    (pixelDataEl.fragments && pixelDataEl.fragments.length>0) ||
-    (transferSyntax && isEncapsulatedTS(transferSyntax)));
+  /* Only treat as encapsulated if fragments actually exist — do NOT use
+     transferSyntax alone, because some uncompressed files report a TS
+     that isEncapsulatedTS() would flag as compressed. */
+  var hasFragments=!!(pixelDataEl.fragments && pixelDataEl.fragments.length>0);
+  var isEncapsulated=!!(pixelDataEl.encapsulatedPixelData || hasFragments);
 
-  if(isEncapsulated && pixelDataEl.fragments && pixelDataEl.fragments.length>0){
+  if(isEncapsulated && hasFragments){
     /* Compressed DICOM - extract and decode */
     var frameData=extractEncapsulatedFrame(ds,pixelDataEl);
-    if(!frameData) return null;
-    try{
-      pixelData=decodeCompressedFrame(frameData,transferSyntax,rows,cols,bitsAlloc,bitsStored,pixelRep,samplesPerPixel);
-    }catch(decodeErr){
-      throw decodeErr; /* Propagate decode errors with helpful messages */
+    if(frameData){
+      try{
+        pixelData=decodeCompressedFrame(frameData,transferSyntax,rows,cols,bitsAlloc,bitsStored,pixelRep,samplesPerPixel);
+      }catch(decodeErr){
+        throw decodeErr; /* Propagate decode errors with helpful messages */
+      }
     }
-    if(!pixelData) return null;
-  }else{
+    /* If extraction failed, fall back to uncompressed read below */
+    if(!pixelData){
+      console.warn('Encapsulated frame extraction failed — falling back to raw pixel data');
+      isEncapsulated=false;
+    }
+  }else if(isEncapsulated && !hasFragments){
+    /* Flagged encapsulated but no fragments — treat as uncompressed */
+    console.warn('File flagged as encapsulated but has no fragments — reading as uncompressed');
+    isEncapsulated=false;
+  }
+
+  if(!isEncapsulated){
     /* Uncompressed DICOM */
     if(bitsAlloc<=8){
       pixelData=new Uint8Array(ds.byteArray.buffer,pixelDataEl.dataOffset,pixelDataEl.length);
