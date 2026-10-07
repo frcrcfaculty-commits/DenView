@@ -81,11 +81,12 @@ frontend/.metro-cache/
 frontend/.expo/
 
 # Mobile development
-android-sdk/ -e 
+android-sdk/
+
 # Environment files
 *.env
 *.env.*
--e 
-# Environment files
-*.env
-*.env.*
+
+# Scratch
+frontend/tmp/
+.emergent/
