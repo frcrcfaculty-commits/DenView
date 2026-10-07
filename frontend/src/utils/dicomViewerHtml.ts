@@ -1,3 +1,5 @@
+import { DICOM_PARSER_JS, JSZIP_JS, LOSSLESS_JS } from './vendorLibs';
+
 export function getDicomViewerHtml(): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -26,9 +28,9 @@ html,body{width:100%;height:100%;overflow:hidden;background:#09090b;touch-action
 <div id="loading"><div class="spinner"></div><span id="loadText">Initializing viewer...</span></div>
 <div id="sliceInfo" class="hidden"></div>
 <div id="progressBar"><div class="text" id="progText">Loading...</div><div class="subtext" id="progSub"></div><div class="bar"><div class="fill" id="progFill" style="width:0%"></div></div></div>
-<script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
-<script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jpeg-lossless-decoder-js/release/current/lossless.js"></script>
+<script>${DICOM_PARSER_JS}</script>
+<script>${JSZIP_JS}</script>
+<script>${LOSSLESS_JS}</script>
 <script>
 (function(){
 'use strict';
