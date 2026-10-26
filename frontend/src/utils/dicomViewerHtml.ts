@@ -1,3 +1,5 @@
+import { DICOM_PARSER_JS, JSZIP_JS, LOSSLESS_JS, OPENJPEG_JS } from './vendorLibs';
+
 export function getDicomViewerHtml(): string {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -26,9 +28,10 @@ html,body{width:100%;height:100%;overflow:hidden;background:#09090b;touch-action
 <div id="loading"><div class="spinner"></div><span id="loadText">Initializing viewer...</span></div>
 <div id="sliceInfo" class="hidden"></div>
 <div id="progressBar"><div class="text" id="progText">Loading...</div><div class="subtext" id="progSub"></div><div class="bar"><div class="fill" id="progFill" style="width:0%"></div></div></div>
-<script src="https://unpkg.com/dicom-parser@1.8.21/dist/dicomParser.min.js"></script>
-<script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/jpeg-lossless-decoder-js/release/current/lossless.js"></script>
+<script>${DICOM_PARSER_JS}</script>
+<script>${JSZIP_JS}</script>
+<script>${LOSSLESS_JS}</script>
+<script>${OPENJPEG_JS}</script>
 <script>
 (function(){
 'use strict';
@@ -80,8 +83,16 @@ function init(){
   resize();
   window.addEventListener('resize',resize);
   setupInput();
-  sendMsg('ready',{});
-  loadText.textContent='Ready';
+  /* OpenJPEG (JPEG 2000) initialises asynchronously; wait for it before
+     reporting ready so the first file can use it. Never block on failure. */
+  var done=false;
+  function ready(){if(done)return;done=true;sendMsg('ready',{});loadText.textContent='Ready';}
+  try{
+    if(typeof OpenJPEGJS==='function'){
+      OpenJPEGJS().then(function(m){openjpeg=m;ready();},function(){ready();});
+      setTimeout(ready,4000);
+    }else{ready();}
+  }catch(e){ready();}
 }
 
 function resize(){
@@ -175,10 +186,12 @@ function extractEncapsulatedFrame(ds,pixelDataEl){
 
 function decodeJPEGLossless(frameData,frameSize,bitsAlloc,pixelRep){
   if(typeof jpeg==='undefined'||!jpeg.lossless||!jpeg.lossless.Decoder){
-    throw new Error('JPEG Lossless decoder not loaded. Check network connection.');
+    throw new Error('JPEG Lossless decoder failed to initialise.');
   }
   var decoder=new jpeg.lossless.Decoder();
-  var output=decoder.decompress(new DataView(frameData.buffer,frameData.byteOffset,frameData.byteLength));
+  /* Decoder wraps its input with new Uint8Array(buffer,offset,length); passing a
+     DataView (old code) produced an empty stream and 'Not a JPEG file'. */
+  var output=decoder.decompress(frameData.buffer,frameData.byteOffset,frameData.byteLength);
   if(!output) throw new Error('JPEG Lossless decode failed');
   if(bitsAlloc<=8) return new Uint8Array(output);
   if(pixelRep===1) return new Int16Array(output);
@@ -284,6 +297,24 @@ function decodeRLE(frameData,rows,cols,bitsAlloc,pixelRep,samplesPerPixel){
   return new Uint16Array(output.buffer);
 }
 
+var openjpeg=null;
+function decodeJPEG2000(frameData,rows,cols,bitsAlloc,pixelRep,spp){
+  if(!openjpeg) throw new Error('JPEG 2000 decoder is still loading. Please try again in a moment.');
+  var dec=new openjpeg.J2KDecoder();
+  try{
+    dec.getEncodedBuffer(frameData.length).set(frameData);
+    dec.decode();
+    var fi=dec.getFrameInfo();
+    if(fi.width!==cols||fi.height!==rows) throw new Error('JPEG 2000 size '+fi.width+'x'+fi.height+' does not match DICOM '+cols+'x'+rows);
+    var copy=new Uint8Array(dec.getDecodedBuffer()); /* copy out of WASM heap before delete() */
+    if(fi.bitsPerSample<=8) return copy;
+    var signed=fi.isSigned||pixelRep===1;
+    return signed?new Int16Array(copy.buffer):new Uint16Array(copy.buffer);
+  }finally{
+    try{dec.delete();}catch(e){}
+  }
+}
+
 function decodeCompressedFrame(frameData,ts,rows,cols,bitsAlloc,bitsStored,pixelRep,spp){
   /* JPEG Lossless (most common for dental CBCT) */
   if(ts===TS_JPEG_LOSSLESS || ts===TS_JPEG_LOSSLESS_P14){
@@ -299,7 +330,7 @@ function decodeCompressedFrame(frameData,ts,rows,cols,bitsAlloc,bitsStored,pixel
   }
   /* JPEG 2000 */
   if(ts===TS_JPEG2K_LOSSLESS || ts===TS_JPEG2K){
-    throw new Error('JPEG 2000 compressed DICOM detected. This format is not yet supported in DentView. Please export your scan as Uncompressed or JPEG Lossless from your CBCT software (Planmeca Romexis, Carestream, iCAT, etc).');
+    return decodeJPEG2000(frameData,rows,cols,bitsAlloc,pixelRep,spp);
   }
   /* JPEG-LS */
   if(ts===TS_JPEGLS_LOSSLESS || ts===TS_JPEGLS){

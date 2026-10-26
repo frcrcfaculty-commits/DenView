@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "DentView",
-    "slug": "frontend",
+    "slug": "dentview",
     "version": "1.0.0",
     "orientation": "default",
     "icon": "./assets/images/icon.png",
@@ -12,7 +12,8 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "Select DICOM files from your library"
-      }
+      },
+      "bundleIdentifier": "com.hansalgandhi.dentview"
     },
     "android": {
       "adaptiveIcon": {
@@ -20,9 +21,8 @@
         "backgroundColor": "#09090b"
       },
       "edgeToEdgeEnabled": true,
-      "permissions": [
-        "READ_EXTERNAL_STORAGE"
-      ]
+      "permissions": [],
+      "package": "com.hansalgandhi.dentview"
     },
     "web": {
       "bundler": "metro",
@@ -34,13 +34,15 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
+          "image": "./assets/images/splash-image.png",
           "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#09090b"
         }
       ],
-      "expo-document-picker"
+      "expo-document-picker",
+      "expo-font",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true

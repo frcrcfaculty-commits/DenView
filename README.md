@@ -5,7 +5,8 @@ A mobile-first DICOM viewer built for maxillofacial radiologists to view dental 
 ## Features
 
 - **DICOM Viewing** — Open single `.dcm` files, multiple files, or ZIP archives containing DICOM series
-- **Compressed DICOM Support** — JPEG Lossless, JPEG Baseline, and RLE transfer syntaxes
+- **Compressed DICOM Support** — JPEG 2000 (lossless + lossy), JPEG Lossless, JPEG Baseline, and RLE transfer syntaxes
+- **Works Offline** — all decoders are bundled into the app; no CDN or network request at runtime
 - **CBCT Series Navigation** — Scroll through hundreds of slices with a smooth scrubber/slider
 - **MPR Reconstruction** — Axial, Coronal, Sagittal, and Panoramic views from volumetric CBCT data
 - **Panoramic Reconstruction** — Auto-detects dental arch shape with maximum intensity projection
@@ -20,7 +21,7 @@ A mobile-first DICOM viewer built for maxillofacial radiologists to view dental 
 
 - **Frontend**: Expo SDK 54, React Native, Expo Router
 - **DICOM Engine**: dicomParser.js in WebView with custom canvas rendering
-- **Compression**: jpeg-lossless-decoder-js, native browser JPEG, custom RLE decoder
+- **Compression**: OpenJPEG (WebAssembly, inlined as base64, via @cornerstonejs/codec-openjpeg) for JPEG 2000, jpeg-lossless-decoder-js, native browser JPEG, custom RLE decoder
 - **ZIP Support**: JSZip for `.zip` archive extraction
 - **Backend**: Minimal FastAPI health check
 
@@ -66,11 +67,30 @@ npx expo start --web
 | JPEG Lossless Process 14 | Supported |
 | JPEG Baseline | Supported |
 | RLE Lossless | Supported |
-| JPEG 2000 | Not yet — re-export as JPEG Lossless |
+| JPEG 2000 Lossless (1.2.840.10008.1.2.4.90) | Supported |
+| JPEG 2000 (1.2.840.10008.1.2.4.91) | Supported |
+| JPEG-LS | Not yet — re-export as JPEG Lossless |
 
 ## Architecture
 
-DICOM rendering runs in a WebView/iframe loading dicomParser.js from CDN. React Native handles file picking, theme, and native UI. Communication via postMessage.
+DICOM rendering runs in a WebView/iframe. dicomParser, JSZip and the decoders are vendored in `frontend/scripts/vendor/` and inlined into the WebView HTML by `node scripts/vendor-libs.js` (generates `src/utils/vendorLibs.ts`), so the viewer needs no network. React Native handles file picking, theme, and native UI. Communication via postMessage.
+
+## Testing
+
+```bash
+node tests/viewer-e2e.mjs   # renders the real viewer offline in headless Edge/Chrome and decodes every fixture
+cd frontend && npx tsc --noEmit && npx expo-doctor
+```
+
+CI (`.github/workflows/ci.yml`) runs typecheck, lint, expo-doctor, the offline end-to-end test and a web export on every push.
+
+## Building an Android APK
+
+```bash
+cd frontend
+npx eas-cli login
+npx eas-cli build -p android --profile preview   # installable APK, built in Expo's cloud
+```
 
 ## Privacy
 
